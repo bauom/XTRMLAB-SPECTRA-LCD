@@ -1,3 +1,24 @@
+@font-face {
+  font-family: "Nocturne Blackletter";
+  src: url("../../assets/fonts/UnifrakturCook-Bold.ttf") format("truetype");
+  font-weight: 700;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Nocturne Serif";
+  src: url("../../assets/fonts/Cinzel.ttf") format("truetype");
+  font-weight: 400 900;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Dashboard Orbitron";
+  src: url("../../assets/fonts/Orbitron-Bold.ttf") format("truetype");
+  font-weight: 400 900;
+  font-display: swap;
+}
+
 :root {
   color-scheme: light dark;
   font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -521,11 +542,34 @@ button:disabled {
   margin-bottom: 14px;
 }
 
+/* The label and the "+ New theme" button share a row so the button
+   sits with the presets it adds to, rather than down in the save row
+   (which is about the layout currently on the canvas, a different
+   thing). */
+.preset-picker-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
 .preset-picker-label {
   display: block;
   font-size: 0.8rem;
   color: #9aa1ab;
-  margin-bottom: 8px;
+}
+
+.preset-head-actions {
+  display: flex;
+  flex: none;
+  gap: 6px;
+}
+
+.preset-new {
+  flex: none;
+  padding: 3px 10px;
+  font-size: 0.78rem;
 }
 
 .preset-grid {
@@ -601,6 +645,18 @@ button:disabled {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* Marks one of the app's own read-only presets. Deliberately a small
+   dim glyph rather than a "BUILT-IN" pill: the footer's width is
+   already the scarce thing here (see .preset-card-actions' comment
+   below), and this only has to answer "can I overwrite this?" at a
+   glance, with the full explanation in the name's tooltip. */
+.preset-card-badge {
+  margin-left: 5px;
+  font-size: 0.62rem;
+  color: #8b93a7;
+  vertical-align: 1px;
 }
 
 /* Duplicate/Delete used to sit here as two always-visible, full-label

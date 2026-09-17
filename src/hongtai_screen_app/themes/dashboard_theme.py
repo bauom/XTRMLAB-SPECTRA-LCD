@@ -119,6 +119,7 @@ dependency is missing.
 import argparse
 import asyncio
 from collections import deque
+from copy import deepcopy
 import functools
 import io
 import json
@@ -127,6 +128,7 @@ import os
 import random
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -144,6 +146,7 @@ from ..driver.hongtai_screen import HongtaiScreen
 from .. import weather
 from .. import power_state
 from ..paths import resource_path
+from . import widget_styles
 
 # ---------------------------------------------------------------- psutil ---
 
@@ -216,20 +219,214 @@ def get_ram_percent():
     return state["prev"] + (state["next"] - state["prev"]) * frac
 
 
+def _pdh_cpu_performance_percent():
+    """`\\Processor Information(_Total)\\% Processor Performance` -- how
+    fast the CPU is actually running right now as a percentage of its
+    *base* clock, read straight from Windows' performance-counter API
+    (PDH) via ctypes. Goes above 100 when boosting, which is the whole
+    point: multiply it by the base clock and you get the real current
+    frequency, turbo included.
+
+    Windows-only and deliberately dependency-free (ctypes, not pywin32
+    or a WMI package). Any failure -- wrong OS, counter missing on an
+    odd SKU, PDH refusing for any reason -- returns None so the caller
+    falls back, rather than taking the whole stat down.
+
+    A PDH counter needs two collections a moment apart to produce a
+    rate, so the query is opened once and kept, and the first call
+    after opening deliberately returns None (there's nothing to
+    compare against yet)."""
+    if sys.platform != "win32":
+        return None
+    global _pdh_state
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:  # noqa: BLE001
+        return None
+
+    try:
+        pdh = ctypes.WinDLL("pdh.dll")
+        if _pdh_state is None:
+            query = wintypes.LPVOID()
+            if pdh.PdhOpenQueryW(None, 0, ctypes.byref(query)) != 0:
+                _pdh_state = False   # don't retry every frame once it's known-bad
+                return None
+            counter = wintypes.LPVOID()
+            # The "English" variant so this keeps working on a
+            # non-English Windows, where the localized counter name
+            # would be something else entirely.
+            if pdh.PdhAddEnglishCounterW(
+                    query, r"\Processor Information(_Total)\% Processor Performance",
+                    0, ctypes.byref(counter)) != 0:
+                pdh.PdhCloseQuery(query)
+                _pdh_state = False
+                return None
+            pdh.PdhCollectQueryData(query)   # priming sample
+            _pdh_state = (pdh, query, counter)
+            return None
+        if _pdh_state is False:
+            return None
+
+        pdh, query, counter = _pdh_state
+        if pdh.PdhCollectQueryData(query) != 0:
+            return None
+
+        class _FMT(ctypes.Structure):
+            _fields_ = [("CStatus", wintypes.DWORD), ("doubleValue", ctypes.c_double)]
+
+        value = _FMT()
+        PDH_FMT_DOUBLE = 0x00000200
+        if pdh.PdhGetFormattedCounterValue(
+                counter, PDH_FMT_DOUBLE, None, ctypes.byref(value)) != 0:
+            return None
+        return value.doubleValue
+    except Exception:  # noqa: BLE001
+        _pdh_state = False
+        return None
+
+
+_pdh_state = None          # None = not opened yet, False = unavailable, else (pdh, query, counter)
+_cpu_freq_state = {"value": None, "sampled_at": 0.0}
+CPU_FREQ_REFRESH = 1.0     # seconds between real reads -- the clock is sampled, not smoothed
+
+
 def get_cpu_freq_ghz():
     """Current CPU clock speed in GHz -- one of this theme's selectable
     stats (see STAT_DEFS' "cpu_freq" entry for its fixed gauge ceiling,
     CPU_FREQ_GAUGE_MAX_GHZ). CPU temp itself isn't shown here at all
     (see get_cpu_stats()'s docstring: the AIO panel already covers it),
     so this is a different number entirely, not a smaller version of
-    the same one."""
+    the same one.
+
+    This used to be `psutil.cpu_freq().current` alone, which on Windows
+    is a lie a lot of the time: psutil reads CurrentMhz out of
+    CallNtPowerInformation(ProcessorInformation), and on modern
+    machines Windows just reports the *nominal* clock there -- so the
+    stat sat on one fixed number forever (reported as "CPU Clock is
+    always showing as 3.4G which isn't accurate", against a CPU whose
+    vendor app was reading 5.5GHz at the same moment). It isn't a
+    smoothing or rounding problem; the number never had the real clock
+    in it to begin with.
+
+    So, in order:
+
+    1. The `% Processor Performance` performance counter (see
+       _pdh_cpu_performance_percent()) against the base clock. This is
+       the reading that actually tracks boost, and it's what Task
+       Manager's own "Speed" field is derived from.
+    2. psutil's `current`, if it's meaningfully different from
+       `max` -- on Linux (and some Windows setups) it IS the live
+       value, so it's a real answer there rather than a fallback.
+    3. psutil's `current` regardless, as a last resort: a fixed number
+       is still better than an empty gauge, and it's what this stat
+       always showed before.
+
+    Sampled at CPU_FREQ_REFRESH rather than per frame: PDH is cheap but
+    not free, and a clock readout that updates once a second reads as
+    steady rather than jittery."""
+    now = time.time()
+    state = _cpu_freq_state
+    if state["value"] is not None and now - state["sampled_at"] < CPU_FREQ_REFRESH:
+        return state["value"]
+
     try:
         freq = psutil.cpu_freq()
     except Exception:  # noqa: BLE001 -- not available on every platform
+        freq = None
+
+    value = None
+    # Base clock: psutil's `max` is the nominal/marketing clock, which
+    # is exactly what the performance counter is a percentage OF.
+    base_mhz = getattr(freq, "max", None) or None
+    percent = _pdh_cpu_performance_percent()
+    if base_mhz and percent:
+        value = (base_mhz * percent / 100.0) / 1000.0
+    elif freq is not None:
+        value = freq.current / 1000.0
+
+    if value is not None:
+        state["value"] = value
+        state["sampled_at"] = now
+    return state["value"] if value is None else value
+
+
+_volume_state = {"value": None, "sampled_at": 0.0}
+_volume_endpoint = None     # None = not tried, False = unavailable, else the IAudioEndpointVolume
+VOLUME_REFRESH = 0.5        # seconds -- fast enough that nudging the volume key looks live
+
+
+def _audio_endpoint():
+    """The system's default playback device's volume interface (pycaw),
+    or False if this machine can't provide one -- not Windows, pycaw
+    not installed, or no output device at all.
+
+    Cached because resolving the endpoint goes through COM device
+    enumeration, which is far too heavy to redo at the render loop's
+    rate; the interface itself stays valid and keeps reporting the
+    current level as the user moves the slider."""
+    global _volume_endpoint
+    if _volume_endpoint is not None:
+        return _volume_endpoint
+    _volume_endpoint = False
+    if sys.platform != "win32":
+        return _volume_endpoint
+    try:
+        import comtypes
+        from ctypes import POINTER, cast
+        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+
+        # The render loop is its own thread and pycaw's COM calls need
+        # that thread initialized; harmless if something else already
+        # did it.
+        try:
+            comtypes.CoInitialize()
+        except Exception:  # noqa: BLE001
+            pass
+        speakers = AudioUtilities.GetSpeakers()
+        interface = speakers.Activate(IAudioEndpointVolume._iid_, comtypes.CLSCTX_ALL, None)
+        _volume_endpoint = cast(interface, POINTER(IAudioEndpointVolume))
+    except Exception:  # noqa: BLE001 -- pycaw missing, no audio device, COM refusing
+        _volume_endpoint = False
+    return _volume_endpoint
+
+
+def get_volume_percent():
+    """The PC's master output volume, 0-100 -- the same number the
+    Windows volume slider shows, and 0 while muted (a gauge reading 40%
+    with nothing audible would be the wrong answer to "what's my
+    volume").
+
+    Windows-only in practice: it needs pycaw (see requirements.txt),
+    which is an optional dependency, so a machine without it just gets
+    None and the stat renders "--" like any other unavailable reading
+    rather than breaking the theme.
+
+    Uses the scalar level (what the slider shows), not the master
+    *dB* level -- the two differ, and the scalar is the one a person
+    recognizes as "my volume is at 40%"."""
+    now = time.time()
+    state = _volume_state
+    if now - state["sampled_at"] < VOLUME_REFRESH:
+        return state["value"]
+    state["sampled_at"] = now
+
+    endpoint = _audio_endpoint()
+    if endpoint is False:
+        state["value"] = None
         return None
-    if freq is None:
-        return None
-    return freq.current / 1000
+    try:
+        if endpoint.GetMute():
+            state["value"] = 0.0
+        else:
+            state["value"] = max(0.0, min(100.0, endpoint.GetMasterVolumeLevelScalar() * 100.0))
+    except Exception:  # noqa: BLE001 -- device unplugged/changed under us
+        # Drop the cached interface so the next read re-resolves
+        # whatever the default device is now.
+        global _volume_endpoint
+        _volume_endpoint = None
+        state["value"] = None
+    return state["value"]
 
 
 def get_disk_usage_percent():
@@ -850,8 +1047,15 @@ STAT_DEFS = {
                        "fmt": lambda v: f"{v:.0f}%"},
     "battery": {"label": "Battery", "title": "BATTERY", "min": 0, "max": 100,
                 "fmt": lambda v: f"{v:.0f}%"},
+    # The PC's master output volume -- the one stat here that isn't
+    # about load or heat, and the only one a person changes on purpose
+    # rather than watches. Reads 0 while muted (see
+    # get_volume_percent()), and "--" on a machine that can't report it
+    # at all, same as any other unavailable sensor.
+    "volume": {"label": "Volume", "title": "VOLUME", "min": 0, "max": 100,
+               "fmt": lambda v: f"{v:.0f}%"},
 }
-# 14 stats, 8 slots -- deliberately more of the former than the latter
+# 15 stats, 8 slots -- deliberately more of the former than the latter
 # (see STAT_DEFS' own comment above about how it's registered) so
 # picking a layout is a real choice, not just "which of exactly 8
 # things goes in the one slot it fits."
@@ -4313,6 +4517,122 @@ BUILTIN_DASHBOARD_PRESETS = {
 }
 
 
+# A dark cathedral backdrop leaves the center clear for Spotify's live
+# Windows media session. Shared gothic styling supplies the typefaces,
+# engraved dials, pointed meters, and ornamental media frame.
+# Build the repeated rows from one small factory to keep their spacing,
+# labels, and stat bindings consistent when this preset is edited.
+def _nocturne_stat_row(stat, label, side, row):
+    y = (0.61, 0.73, 0.85)[row]
+    x = 0.075 if side == "left" else 0.925
+    return [
+        {
+            "id": f"nocturne_{side}_{stat}_reading", "type": "text",
+            "stat": stat, "template": f"{label}  {{value}}",
+            "x": x, "y": y, "font_size": 0.036,
+            "color": (239, 229, 218),
+            "align": "left" if side == "left" else "right",
+            "bold": True,
+            "plate": (9, 7, 12), "plate_opacity": 0.82,
+            "plate_pad": 0.32,
+            "opacity": 1.0, "z": 20 + row,
+        },
+        {
+            "id": f"nocturne_{side}_{stat}_meter", "type": "bar",
+            "stat": stat, "x": 0.18 if side == "left" else 0.82,
+            "y": round(y + 0.047, 3), "width": 0.205, "height": 0.018,
+            "orientation": "horizontal",
+            "show_knob": False, "show_title": False, "show_value": False,
+            "opacity": 1.0,
+            "z": 30 + row,
+        },
+    ]
+
+
+BUILTIN_DASHBOARD_PRESETS["Nocturne Cathedral"] = {
+    "background": {
+        "mode": "nocturne", "scheme": "crimson", "image_path": None,
+        "border": [132, 112, 106], "dim": 0.28, "widget_style": "gothic",
+    },
+    "elements": [
+        {
+            "id": "nocturne_title", "type": "text", "text": "Nocturne",
+            "x": 0.5, "y": 0.075, "font_size": 0.09,
+            "color": (232, 220, 210), "align": "center", "bold": True,
+            "font": "unifraktur", "opacity": 1.0, "z": 1,
+        },
+        {
+            "id": "nocturne_music_label", "type": "text", "text": "NOW PLAYING",
+            "x": 0.5, "y": 0.15, "font_size": 0.027,
+            "color": (181, 82, 96), "align": "center", "bold": True,
+            "opacity": 1.0, "z": 2,
+        },
+        {
+            "id": "nocturne_cpu_dial", "type": "gauge", "stat": "cpu_load",
+            "x": 0.18, "y": 0.345, "radius": 0.145,
+            "opacity": 1.0, "z": 3,
+        },
+        {
+            "id": "nocturne_gpu_dial", "type": "gauge", "stat": "gpu_load",
+            "x": 0.82, "y": 0.345, "radius": 0.145,
+            "opacity": 1.0, "z": 4,
+        },
+        *[el for row, (stat, label) in enumerate((
+            ("ram", "RAM"),
+            ("cpu_freq", "CLOCK"), ("disk_usage", "DISK"),
+        )) for el in _nocturne_stat_row(stat, label, "left", row)],
+        *[el for row, (stat, label) in enumerate((
+            ("gpu_temp", "TEMP"),
+            ("vram_usage", "VRAM"), ("network", "NET"),
+        )) for el in _nocturne_stat_row(stat, label, "right", row)],
+        {
+            "id": "nocturne_spotify", "type": "media",
+            "x": 0.5, "y": 0.47, "width": 0.315, "height": 0.59,
+            "show_art": True, "show_name": True, "show_time": True,
+            "opacity": 1.0, "z": 50,
+        },
+        {
+            "id": "nocturne_clock", "type": "clock",
+            "x": 0.5, "y": 0.855, "font_size": 0.056,
+            "color": (232, 220, 210), "show_seconds": False,
+            "show_date": True, "face": "digital", "hour_format": "24h",
+            "opacity": 1.0, "z": 51,
+        },
+    ],
+}
+
+
+def _styled_dashboard_preset(style, title, background, prefix):
+    """Keep the music and useful readings in the same readable arrangement.
+
+    Only geometry is shared. Font, metalwork, needles, meters, media frame,
+    and palette are supplied by the selected style, with normal overrides.
+    """
+    preset = deepcopy(BUILTIN_DASHBOARD_PRESETS["Nocturne Cathedral"])
+    preset["background"] = {**background, "widget_style": style, "image_path": None}
+    for el in preset["elements"]:
+        el["id"] = el["id"].replace("nocturne", prefix)
+        el.pop("color", None)
+        el.pop("font", None)
+        if el.get("plate"):
+            el["plate"] = widget_styles.STYLES[style]["defaults"]["face_color"]
+        if el["id"] == f"{prefix}_title":
+            el.update(text=title, font_size=0.052 if style == "cyberpunk" else 0.047)
+        if el["id"] == f"{prefix}_music_label":
+            el["color"] = widget_styles.STYLES[style]["defaults"]["color"]
+        if style == "cyberpunk" and el.get("type") == "text" and el.get("stat"):
+            el["font_size"] = 0.029
+    return preset
+
+
+BUILTIN_DASHBOARD_PRESETS["Neon Ronin"] = _styled_dashboard_preset(
+    "cyberpunk", "NEON // RONIN",
+    {"mode": "ronin", "scheme": "blue", "border": [33, 224, 238], "dim": 0.26}, "ronin")
+BUILTIN_DASHBOARD_PRESETS["Arcane Observatory"] = _styled_dashboard_preset(
+    "high_fantasy", "Arcane Observatory",
+    {"mode": "arcane", "scheme": "emerald", "border": [191, 157, 88], "dim": 0.3}, "arcane")
+
+
 
 def _element_accent(el):
     """An element's gauge color: an explicit `color` (r, g, b) tuple if
@@ -4513,6 +4833,17 @@ def _draw_text_plate(img, el, text, font, pos, anchor, size_px, opacity):
     box = [left - pad_x, top - pad_y, right + pad_x, bottom + pad_y]
     radius = max(0, (box[3] - box[1]) * float(el.get("plate_radius", 0.28)))
     plate_opacity = float(el.get("plate_opacity", 1.0)) * opacity
+    if el.get("widget_style") in widget_styles.STYLES:
+        layer = Image.new("RGBA", img.size)
+        d = ImageDraw.Draw(layer)
+        x0, y0, x1, y1 = box
+        cut = min(4, (y1-y0)/4)
+        points = [(x0+cut, y0), (x1-cut, y0), (x1, y0+cut), (x1, y1-cut),
+                  (x1-cut, y1), (x0+cut, y1), (x0, y1-cut), (x0, y0+cut)]
+        d.polygon(points, fill=(*plate, max(0, min(255, round(255*plate_opacity)))))
+        d.line([(x0+cut, y1), (x1-cut, y1)], fill=(*widget_styles.color(el, "ornament_color"), round(90*opacity)))
+        img.paste(layer, (0, 0), layer)
+        return
     if plate_opacity >= 1.0:
         rounded_rect(draw, box, radius=radius, fill=plate)
         return
@@ -4683,6 +5014,11 @@ def _draw_clock_element(img, el, width, height, fonts):
     # The date line inherits the clock's own font family (it's the same
     # element, just a second line), only smaller and never bolded.
     date_font = _cached_scaled_font(max(7, int(size_px * 0.45)), False, family) if show_date else None
+    if el.get("widget_style") in widget_styles.STYLES:
+        ornament = Image.new("RGBA", img.size)
+        widget_styles.rule(ImageDraw.Draw(ornament), x-size_px*2.5, x+size_px*2.5,
+                           y-size_px*.95, (*widget_styles.color(el, "ornament_color"), round(180*opacity)), el["widget_style"])
+        img.paste(ornament, (0, 0), ornament)
 
     # `el["gradient"]` (2-4 stops, same fields text/graph/bar/gauge all
     # use) fills the time -- and date, if shown, a touch dimmer, same
@@ -4931,8 +5267,10 @@ def _draw_graph_static(img, el, box, fonts):
         return
     stat_def = STAT_DEFS.get(el.get("stat"))
     title = stat_def["title"] if stat_def else str(el.get("stat", "")).upper()
-    draw.text((box["cx"], box["y0"] - 10), title, font=fonts.small_title,
-              fill=(225, 226, 236), anchor="mb")
+    gothic = el.get("widget_style") in widget_styles.STYLES
+    draw.text((box["cx"], box["y0"] - (22 if gothic else 10)), title,
+              font=_cached_scaled_font(11, True, el.get("font")) if gothic else fonts.small_title,
+              fill=widget_styles.color(el, "text_color") if gothic else (225, 226, 236), anchor="mb")
 
 
 def _draw_graph_tile(el, box, values, accent, gradient_colors=None, gradient_direction="horizontal"):
@@ -5045,8 +5383,10 @@ def _draw_bar_static(img, el, box, fonts):
     draw = ImageDraw.Draw(img)
     stat_def = STAT_DEFS.get(el.get("stat"))
     title = stat_def["title"] if stat_def else str(el.get("stat", "")).upper()
-    draw.text((box["cx"], box["y0"] - 10), title, font=fonts.small_title,
-              fill=(225, 226, 236), anchor="mb")
+    gothic = el.get("widget_style") in widget_styles.STYLES
+    draw.text((box["cx"], box["y0"] - (22 if gothic else 10)), title,
+              font=_cached_scaled_font(11, True, el.get("font")) if gothic else fonts.small_title,
+              fill=widget_styles.color(el, "text_color") if gothic else (225, 226, 236), anchor="mb")
 
 
 def _draw_bar_dynamic(img, el, box, value, min_v, max_v, accent, font_value, value_fmt):
@@ -5191,6 +5531,9 @@ BACKGROUND_PRESETS = {
     "fusion": "Fusion Core (card chassis)",
     "neon": "Neon Pulse (card chassis)",
     "crimson": "Crimson Strike (card chassis)",
+    "nocturne": "Nocturne Cathedral (image)",
+    "ronin": "Neon Ronin (image)",
+    "arcane": "Arcane Observatory (image)",
     "image": "Custom image",
 }
 # The four "(image)" entries above aren't a user's own photo (that's
@@ -5215,6 +5558,9 @@ BUNDLED_BACKGROUND_IMAGES = {
     "circuit": "circuit_bloom.jpg",
     "cherry": "cherry_blossom.jpg",
     "lavender": "lavender_bloom.jpg",
+    "nocturne": "nocturne_cathedral.jpg",
+    "ronin": "neon_ronin.jpg",
+    "arcane": "arcane_observatory.jpg",
     # The three "chassis" backgrounds -- not pictures the layout sits
     # on but the cards/panels it sits *in*, drawn at the same
     # fraction-of-panel coordinates as their presets' elements (see
@@ -5261,6 +5607,10 @@ def dim_color(color, factor):
 # old system-font candidate list below, so nothing that already exists
 # re-renders differently.
 FONT_FAMILIES = {
+    "unifraktur": {"label": "UnifrakturCook (blackletter)",
+                    "regular": "UnifrakturCook-Bold.ttf", "bold": "UnifrakturCook-Bold.ttf"},
+    "cinzel": {"label": "Cinzel (engraved serif)",
+                "regular": "Cinzel.ttf", "bold": "Cinzel.ttf"},
     "default": {"label": "Default (system sans)", "regular": None, "bold": None},
     "poppins": {"label": "Poppins (modern UI)",
                 "regular": "Poppins-Regular.ttf", "bold": "Poppins-SemiBold.ttf"},
@@ -5299,7 +5649,10 @@ def load_font(size, bold=False, family=None):
         filename = spec["bold"] if bold else spec["regular"]
         if filename:
             try:
-                return ImageFont.truetype(resource_path("fonts", filename), size)
+                font = ImageFont.truetype(resource_path("fonts", filename), size)
+                if family == "cinzel":
+                    font.set_variation_by_axes([650 if bold else 450])
+                return font
             except Exception:  # noqa: BLE001 -- missing/corrupt bundled font
                 pass
     if bold:
@@ -6251,6 +6604,7 @@ def build_static_background(width, height, fonts, elements=None, background=None
     """
     elements = DEFAULT_ELEMENTS if elements is None else elements
     background = dict(DEFAULT_BACKGROUND, **(background or {}))
+    elements = [widget_styles.resolve_element(el, background) for el in elements]
 
     img = _build_background_image(width, height, background)
     draw = ImageDraw.Draw(img)
@@ -6266,8 +6620,11 @@ def build_static_background(width, height, fonts, elements=None, background=None
     border = (background or {}).get("border", "default")
     if border not in ("none", False):
         border_color = tuple(border) if isinstance(border, (list, tuple)) else dim_color(PANEL_BORDER, 0.7)
-        rounded_rect(draw, [margin, margin, width - margin, height - margin],
-                     radius=10, outline=border_color, width=2)
+        if background.get("widget_style") in widget_styles.STYLES:
+            widget_styles.draw_frame(img, border_color, background["widget_style"])
+        else:
+            rounded_rect(draw, [margin, margin, width - margin, height - margin],
+                         radius=10, outline=border_color, width=2)
 
     base = min(width, height)
     resolved = {}
@@ -6280,6 +6637,9 @@ def build_static_background(width, height, fonts, elements=None, background=None
             accent = _element_accent(el)
             gauge_gradient, gauge_gradient_dir = _element_gauge_gradient(el)
             title = STAT_DEFS[el["stat"]]["title"]
+            if el.get("widget_style") in widget_styles.STYLES:
+                widget_styles.draw_gauge_static(img, el, g, title, _cached_scaled_font)
+                continue
             tile = draw_gauge_static(g, accent, gradient_colors=gauge_gradient, gradient_direction=gauge_gradient_dir)
             tile = _apply_tile_opacity(tile, el.get("opacity", 1.0))
             # `rotation` is stored and round-trips through config/
@@ -6628,6 +6988,10 @@ def _draw_media_element(img, el, box, media, fonts):
     content -- the whole point of dragging boxes next to each other.
     Turning a piece off still doesn't leave a gap where it used to be,
     same as before."""
+    if el.get("widget_style") in widget_styles.STYLES:
+        widget_styles.draw_media(img, el, box, media, _cached_scaled_font,
+                                _load_default_art(), _not_playing_message or "Awaiting Spotify")
+        return
     mid_cx, mid_w, box_h = box["cx"], box["w"], box["h"]
     opacity = el.get("opacity", 1.0)
     show_art = el.get("show_art", True)
@@ -6759,6 +7123,9 @@ def render_frame(background, layout, width, height, fonts, stats, media, history
         if etype == "gauge":
             g = layout["resolved"][el["id"]]
             stat = STAT_DEFS[el["stat"]]
+            if el.get("widget_style") in widget_styles.STYLES:
+                widget_styles.draw_gauge_dynamic(img, el, g, stats.get(el["stat"]), stat, _cached_scaled_font)
+                continue
             accent = _element_accent(el)
             gauge_gradient, gauge_gradient_dir = _element_gauge_gradient(el)
             big = g["radius"] >= base * BIG_GAUGE_RADIUS_FRACTION
@@ -6780,6 +7147,9 @@ def render_frame(background, layout, width, height, fonts, stats, media, history
                 continue
             stat_def = STAT_DEFS.get(el.get("stat"))
             if stat_def is None:
+                continue
+            if el.get("widget_style") in widget_styles.STYLES:
+                widget_styles.draw_bar(img, el, box, stats.get(el["stat"]), stat_def, _cached_scaled_font)
                 continue
             accent = _element_color(el, default=ACCENT_CPU)
             _draw_bar_dynamic(img, el, box, stats.get(el["stat"]), stat_def["min"], stat_def["max"],
@@ -6811,7 +7181,7 @@ _THUMBNAIL_STATS = {
     "cpu_load": 42, "gpu_load": 55, "gpu_temp": 58, "ram": 61,
     "network": 12.4, "cpu_freq": 3.6, "disk_usage": 47, "vram_usage": 38,
     "swap": 5, "disk_io": 8.2, "gpu_power": 95, "process_count": 210,
-    "cpu_load_peak": 68, "battery": 80,
+    "cpu_load_peak": 68, "battery": 80, "volume": 45,
 }
 
 _thumbnail_fonts_cache = None
@@ -6945,6 +7315,7 @@ def render_live_preview(elements, background, width=REFERENCE_WIDTH, height=REFE
         "process_count": get_process_count(),
         "cpu_load_peak": get_cpu_load_peak_core(),
         "battery": get_battery_percent(),
+        "volume": get_volume_percent(),
     }
     history = {}
     for el in elements:
@@ -7178,6 +7549,7 @@ def run(port=None, web_port=8765, enable_web=True, default_art_path=None,
                     "process_count": get_process_count(),
                     "cpu_load_peak": get_cpu_load_peak_core(),
                     "battery": get_battery_percent(),
+                    "volume": get_volume_percent(),
                 }
 
                 for graph_id, buf in history.items():

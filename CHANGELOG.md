@@ -1900,6 +1900,152 @@ dashboard designer) this is laying groundwork for.
   Save layout persists both its elements and its background (including
   the new border/dim keys); the new Font and Label chip controls
   render for a selected text element; no console errors.
+- **Built-in presets are read-only now; editing one saves a copy.**
+  Requested directly: "default themes shouldn't be modified, like if a
+  user tries to modify them, we create a duplicate of it where the
+  user does his modifications". Saving a preset under a built-in's
+  exact name used to overwrite it — the saved copy shadowed the
+  code-defined one from then on, which is a bad bargain in both
+  directions: the only way to tweak a built-in also destroyed your
+  access to the original (nothing could bring it back), and it froze
+  that slot against any future app update to it. `save_dashboard_
+  preset()` now detects the collision and saves under a free derived
+  name instead ("Fusion Core" → "Fusion Core (custom)", then
+  "(custom 2)", …), returning the name it actually used so the UI
+  reports what happened rather than claiming a save that landed
+  somewhere else. Saving over one of *your own* presets is unchanged —
+  it still overwrites in place, which is what editing your own work
+  should do.
+  - A one-time migration (`migrate_unshadow_builtin_presets()`)
+    renames any existing saved preset that shadows a built-in aside to
+    "<name> (custom)", so an install that had already customized one
+    keeps that work *and* gets the original back. It runs after the
+    existing strip-redundant-copies migration, so what it sees is
+    always a real customization rather than a stale duplicate.
+  - Deleting a built-in is now the only thing that can be done *to*
+    one, so it got an undo: the button reads "Hide" for a built-in,
+    and a "Restore built-ins" button appears while any are hidden
+    (`restore_dismissed_dashboard_presets()`, `POST /api/dashboard/
+    presets/restore_builtins`). It used to have an accidental undo —
+    saving anything under that name un-dismissed it — which this
+    change would otherwise have quietly removed.
+  - The picker marks every built-in with a small ◆ and warns *before*
+    you save, as soon as the name you've typed matches one.
+  Verified in the browser harness: the warning appears while typing a
+  built-in's name; saving it leaves the built-in in place and creates
+  "Fusion Core (custom)", then "(custom 2)" on a second save; saving
+  over a user's own preset still overwrites it rather than piling up
+  copies; hiding a built-in removes it from the picker and offers the
+  restore, which brings it back; no console errors.
+- **Fixed: graphs highlighting themselves in the design canvas.**
+  Reported with a screenshot of "Neon Horizon": the network graph sat
+  under a bright gradient-filled box with "NETWORK" written across it,
+  while nothing was selected. That box was the editor's own mockup
+  overlay, not the render. Every other element type hides its mockup
+  once the canvas is showing an accurate backdrop (the panel's live
+  frame, or the live-rendered preview of an unsaved edit) — graphs
+  were exempt, on the reasoning that the SVG overlay can't plot the
+  line so the box was the only thing making the region locatable. Both
+  halves of that were wrong: the backdrop draws the graph *in full*
+  (frame, title and line), so there was nothing to locate that wasn't
+  already drawn, and the mockup is a filled box with the element's
+  name across it rather than a faint outline, so forcing it over the
+  real render read exactly as reported — a graph lighting itself up
+  for no reason. Graphs now follow the same rule as everything else.
+  Dragging is unaffected: the transparent hit rect that stands in for
+  a hidden mockup already covered that. Verified in all four states —
+  deselected over a live frame (hidden), selected (shown), deselected
+  again (hidden), and with the panel disconnected so there's no
+  backdrop to defer to (shown) — plus that the graph is still
+  draggable while its mockup is hidden.
+- **A "+ New theme" button**, next to the Presets label. Requested:
+  "add a button for creating a new custom theme, we only have
+  duplicate now" — which was exactly right. Every route to a new
+  preset started from an existing one: Duplicate copies a card, and
+  "Save current layout as preset" bottles up whatever happens to be on
+  the canvas, so building something of your own meant first taking
+  someone else's layout apart element by element. This saves an empty
+  preset (auto-named "New theme", "New theme 2", …), drops the canvas
+  straight into editing it, and prefills the save box with its name so
+  "Save as preset" updates that same card instead of spawning another.
+  Deliberately empty rather than seeded with the default gauges —
+  "Reset to defaults" already puts that layout on the canvas, so
+  seeding it here would just be a second, worse Duplicate — though it
+  does keep whatever background is currently staged, since starting on
+  a bare black rectangle is a strange kind of blank. Verified: the
+  button creates the card without disturbing the other presets, the
+  canvas comes up with no elements, adding one and saving under the
+  prefilled name updates that card rather than making a second, a
+  second click produces "New theme 2", and an empty theme still
+  renders a real (background-only) thumbnail instead of a "No preview"
+  card.
+- **Import and export themes.** Prompted by a theme a friend had made
+  and shared as a .json — which, before this, could only be installed
+  by hand-editing `app_config.json` and copying its background picture
+  into the managed image folder manually. Both directions now exist:
+  "Export" on any preset card's ⋯ menu saves it as a .json, and
+  "Import theme" next to "+ New theme" takes one back.
+  - The hard part isn't the layout — a preset is already plain JSON —
+    it's the pictures. Any image a preset references (background,
+    image element, clock face) is stored as an absolute path into
+    *this* machine's managed image folder, which means nothing on
+    anyone else's. Export therefore inlines each referenced image as
+    base64 and drops the path; import writes those bytes into the
+    receiving machine's own image store and repoints the preset at the
+    new copies. The exported file is self-contained.
+  - **Import doesn't trust a path it's given.** A preset file comes
+    from someone else, and a bare `image_path` in one would otherwise
+    let it aim the panel at any file on the receiving disk. Only
+    images that actually travelled with the file, or paths already
+    inside this machine's image store, survive; anything else is
+    dropped to None, which every renderer here already treats as "no
+    image". Shape is validated too (`elements` must be a list,
+    `background` an object), so a malformed file reports an error
+    instead of half-loading.
+  - Importing under a built-in's name lands as a copy, same as any
+    other save. Imported themes are named from the filename, tidied
+    up: `nocturne_cathedral.json` becomes "Nocturne Cathedral", while
+    a name that already has capitals is left exactly as sent rather
+    than being mangled into "Gpu Monitor".
+  - Export strips the 8-character content-hash prefix `image_store`
+    adds to a stored copy before sending the name along — otherwise
+    every export/import round trip stacked another prefix
+    (`ab12_ab12_shot.png`) and stored a second identical copy instead
+    of deduplicating onto the first. Verified stable across three
+    round trips, one file on disk.
+  Verified end to end: exporting a preset downloads a .json with its
+  images inlined, re-importing that file restores it, a real
+  friend-made theme file imports cleanly, and malformed JSON and
+  wrong-shaped JSON each surface a specific error rather than failing
+  silently.
+- **Fixed: CPU Clock stuck on one number.** Reported as "always
+  showing as 3.4G which isn't accurate" — and it wasn't a rounding or
+  smoothing problem, the reading never contained the live clock at
+  all. `get_cpu_freq_ghz()` was `psutil.cpu_freq().current`, which on
+  Windows comes from `CallNtPowerInformation(ProcessorInformation)`;
+  on modern machines Windows reports the *nominal* clock there, so the
+  stat sat on the base frequency forever while the vendor app read
+  5.5GHz on the same CPU at the same moment. It now reads the
+  `\Processor Information(_Total)\% Processor Performance` performance
+  counter (PDH, via ctypes — no new dependency) and multiplies it by
+  the base clock, which is how Task Manager's own "Speed" field is
+  derived and which goes above 100% when boosting. psutil remains the
+  fallback, so Linux (where its `current` really is live) and any
+  machine missing that counter are unaffected. Sampled once a second
+  rather than per frame.
+- **A new "Volume" stat**, available to every element type (gauge,
+  bar, graph, stat-bound text) like any other. Reports the PC's master
+  output level 0-100%, and 0 while muted — a gauge sitting at 40% with
+  nothing audible would be the wrong answer to "what's my volume".
+  Needs `pycaw`, which is an optional dependency: without it the stat
+  reads "--" and nothing else changes. Install with
+  `py -m pip install pycaw` (it's in requirements.txt now).
+- **`scripts/check_sensors.py`**, a read-only diagnostic for exactly
+  the two readings above, since neither can be verified anywhere but
+  the Windows machine the panel is on. Prints psutil's clock, the perf
+  counter, and the resulting frequency five times a second apart (to
+  compare against Task Manager), plus whether pycaw is present and
+  whether the volume reading follows the slider.
 
 ## [1.0.0] — 2026-08-29
 

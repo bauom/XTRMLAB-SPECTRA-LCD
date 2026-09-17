@@ -1,31 +1,12 @@
-# Bundled fonts
+Copyright (c) 2010, j. 'mach' wust, with Reserved Font Name UnifrakturCook.
+Copyright (c) 2009, Peter Wiegel.
 
-The `.ttf` files in this folder are the display faces the built-in
-dashboard presets are designed around (see `FONT_FAMILIES` in
-`src/hongtai_screen_app/themes/dashboard_theme.py`). They are all
-licensed under the **SIL Open Font License, Version 1.1**, which
-permits bundling and redistribution with this application.
+This Font Software is licensed under the SIL Open Font License, Version 1.1.
+This license is copied below, and is also available with a FAQ at:
+http://scripts.sil.org/OFL
 
-| File(s) | Family | Copyright |
-| --- | --- | --- |
-| `UnifrakturCook-Bold.ttf` | UnifrakturCook | Copyright 2010 j. 'mach' wust; Copyright 2009 Peter Wiegel. See `unifrakturcook-OFL.txt`. |
-| `Cinzel.ttf` | Cinzel | Copyright 2020 The Cinzel Project Authors (https://github.com/NDISCOVER/Cinzel). See `cinzel-OFL.txt`. |
-| `Poppins-Regular.ttf`, `Poppins-SemiBold.ttf`, `Poppins-Bold.ttf` | Poppins | Copyright 2020 The Poppins Project Authors (https://github.com/itfoundry/Poppins) |
-| `Orbitron-Bold.ttf`, `Orbitron-Black.ttf` | Orbitron | Copyright 2018 The Orbitron Project Authors (https://github.com/theleagueof/orbitron) |
-| `ChakraPetch-Bold.ttf` | Chakra Petch | Copyright 2018 The Chakra Petch Project Authors (https://github.com/m4rc1e/Chakra-Petch.git) |
-| `BebasNeue-Regular.ttf` | Bebas Neue | Copyright 2019 The Bebas Neue Project Authors (https://github.com/dharmatype/Bebas-Neue) |
-| `Anton-Regular.ttf` | Anton | Copyright 2020 The Anton Project Authors (https://github.com/googlefonts/AntonFont.git) |
-| `ArchivoBlack-Regular.ttf` | Archivo Black | Copyright 2017 The Archivo Black Project Authors (https://github.com/Omnibus-Type/ArchivoBlack) |
 
-UnifrakturCook and Cinzel are unmodified TrueType fonts from the
-[Google Fonts repository](https://github.com/google/fonts/tree/main/ofl).
-Cinzel includes its variable weight axis. Their original licenses are
-bundled alongside them. The remaining files are the Latin subset, converted from the `@fontsource/*`
-npm distribution's `.woff2` back to `.ttf` (Pillow's
-`ImageFont.truetype()` can't read WOFF2), with no other modification.
-
-The full license text follows.
-
+-----------------------------------------------------------
 SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007
 -----------------------------------------------------------
 

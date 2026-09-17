@@ -1,0 +1,301 @@
+{
+  "background": {
+    "mode": "ronin",
+    "scheme": "blue",
+    "border": [
+      33,
+      224,
+      238
+    ],
+    "dim": 0.26,
+    "widget_style": "cyberpunk",
+    "image_path": null
+  },
+  "elements": [
+    {
+      "id": "ronin_title",
+      "type": "text",
+      "text": "NEON // RONIN",
+      "x": 0.5,
+      "y": 0.075,
+      "font_size": 0.052,
+      "align": "center",
+      "bold": true,
+      "opacity": 1.0,
+      "z": 1
+    },
+    {
+      "id": "ronin_music_label",
+      "type": "text",
+      "text": "NOW PLAYING",
+      "x": 0.5,
+      "y": 0.15,
+      "font_size": 0.027,
+      "align": "center",
+      "bold": true,
+      "opacity": 1.0,
+      "z": 2,
+      "color": [
+        33,
+        224,
+        238
+      ]
+    },
+    {
+      "id": "ronin_cpu_dial",
+      "type": "gauge",
+      "stat": "cpu_load",
+      "x": 0.18,
+      "y": 0.345,
+      "radius": 0.145,
+      "opacity": 1.0,
+      "z": 3
+    },
+    {
+      "id": "ronin_gpu_dial",
+      "type": "gauge",
+      "stat": "gpu_load",
+      "x": 0.82,
+      "y": 0.345,
+      "radius": 0.145,
+      "opacity": 1.0,
+      "z": 4
+    },
+    {
+      "id": "ronin_left_ram_reading",
+      "type": "text",
+      "stat": "ram",
+      "template": "RAM  {value}",
+      "x": 0.075,
+      "y": 0.61,
+      "font_size": 0.029,
+      "align": "left",
+      "bold": true,
+      "plate": [
+        6,
+        17,
+        28
+      ],
+      "plate_opacity": 0.82,
+      "plate_pad": 0.32,
+      "opacity": 1.0,
+      "z": 20
+    },
+    {
+      "id": "ronin_left_ram_meter",
+      "type": "bar",
+      "stat": "ram",
+      "x": 0.18,
+      "y": 0.657,
+      "width": 0.205,
+      "height": 0.018,
+      "orientation": "horizontal",
+      "show_knob": false,
+      "show_title": false,
+      "show_value": false,
+      "opacity": 1.0,
+      "z": 30
+    },
+    {
+      "id": "ronin_left_cpu_freq_reading",
+      "type": "text",
+      "stat": "cpu_freq",
+      "template": "CLOCK  {value}",
+      "x": 0.075,
+      "y": 0.73,
+      "font_size": 0.029,
+      "align": "left",
+      "bold": true,
+      "plate": [
+        6,
+        17,
+        28
+      ],
+      "plate_opacity": 0.82,
+      "plate_pad": 0.32,
+      "opacity": 1.0,
+      "z": 21
+    },
+    {
+      "id": "ronin_left_cpu_freq_meter",
+      "type": "bar",
+      "stat": "cpu_freq",
+      "x": 0.18,
+      "y": 0.777,
+      "width": 0.205,
+      "height": 0.018,
+      "orientation": "horizontal",
+      "show_knob": false,
+      "show_title": false,
+      "show_value": false,
+      "opacity": 1.0,
+      "z": 31
+    },
+    {
+      "id": "ronin_left_disk_usage_reading",
+      "type": "text",
+      "stat": "disk_usage",
+      "template": "DISK  {value}",
+      "x": 0.075,
+      "y": 0.85,
+      "font_size": 0.029,
+      "align": "left",
+      "bold": true,
+      "plate": [
+        6,
+        17,
+        28
+      ],
+      "plate_opacity": 0.82,
+      "plate_pad": 0.32,
+      "opacity": 1.0,
+      "z": 22
+    },
+    {
+      "id": "ronin_left_disk_usage_meter",
+      "type": "bar",
+      "stat": "disk_usage",
+      "x": 0.18,
+      "y": 0.897,
+      "width": 0.205,
+      "height": 0.018,
+      "orientation": "horizontal",
+      "show_knob": false,
+      "show_title": false,
+      "show_value": false,
+      "opacity": 1.0,
+      "z": 32
+    },
+    {
+      "id": "ronin_right_gpu_temp_reading",
+      "type": "text",
+      "stat": "gpu_temp",
+      "template": "TEMP  {value}",
+      "x": 0.925,
+      "y": 0.61,
+      "font_size": 0.029,
+      "align": "right",
+      "bold": true,
+      "plate": [
+        6,
+        17,
+        28
+      ],
+      "plate_opacity": 0.82,
+      "plate_pad": 0.32,
+      "opacity": 1.0,
+      "z": 20
+    },
+    {
+      "id": "ronin_right_gpu_temp_meter",
+      "type": "bar",
+      "stat": "gpu_temp",
+      "x": 0.82,
+      "y": 0.657,
+      "width": 0.205,
+      "height": 0.018,
+      "orientation": "horizontal",
+      "show_knob": false,
+      "show_title": false,
+      "show_value": false,
+      "opacity": 1.0,
+      "z": 30
+    },
+    {
+      "id": "ronin_right_vram_usage_reading",
+      "type": "text",
+      "stat": "vram_usage",
+      "template": "VRAM  {value}",
+      "x": 0.925,
+      "y": 0.73,
+      "font_size": 0.029,
+      "align": "right",
+      "bold": true,
+      "plate": [
+        6,
+        17,
+        28
+      ],
+      "plate_opacity": 0.82,
+      "plate_pad": 0.32,
+      "opacity": 1.0,
+      "z": 21
+    },
+    {
+      "id": "ronin_right_vram_usage_meter",
+      "type": "bar",
+      "stat": "vram_usage",
+      "x": 0.82,
+      "y": 0.777,
+      "width": 0.205,
+      "height": 0.018,
+      "orientation": "horizontal",
+      "show_knob": false,
+      "show_title": false,
+      "show_value": false,
+      "opacity": 1.0,
+      "z": 31
+    },
+    {
+      "id": "ronin_right_network_reading",
+      "type": "text",
+      "stat": "network",
+      "template": "NET  {value}",
+      "x": 0.925,
+      "y": 0.85,
+      "font_size": 0.029,
+      "align": "right",
+      "bold": true,
+      "plate": [
+        6,
+        17,
+        28
+      ],
+      "plate_opacity": 0.82,
+      "plate_pad": 0.32,
+      "opacity": 1.0,
+      "z": 22
+    },
+    {
+      "id": "ronin_right_network_meter",
+      "type": "bar",
+      "stat": "network",
+      "x": 0.82,
+      "y": 0.897,
+      "width": 0.205,
+      "height": 0.018,
+      "orientation": "horizontal",
+      "show_knob": false,
+      "show_title": false,
+      "show_value": false,
+      "opacity": 1.0,
+      "z": 32
+    },
+    {
+      "id": "ronin_spotify",
+      "type": "media",
+      "x": 0.5,
+      "y": 0.47,
+      "width": 0.315,
+      "height": 0.59,
+      "show_art": true,
+      "show_name": true,
+      "show_time": true,
+      "opacity": 1.0,
+      "z": 50
+    },
+    {
+      "id": "ronin_clock",
+      "type": "clock",
+      "x": 0.5,
+      "y": 0.855,
+      "font_size": 0.056,
+      "show_seconds": false,
+      "show_date": true,
+      "face": "digital",
+      "hour_format": "24h",
+      "opacity": 1.0,
+      "z": 51
+    }
+  ]
+}

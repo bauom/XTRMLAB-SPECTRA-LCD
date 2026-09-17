@@ -68,7 +68,8 @@ from .themes import demo_clock
 from .paths import ICON_PATH, SHOW_TRIGGER_PATH, _write_startup_log
 from .config_store import (AUTO_DETECT, THEME_TAB_ORDER, load_config, save_config,
                             migrate_dashboard_elements, migrate_dashboard_weather_element,
-                            migrate_strip_redundant_builtin_presets, migrate_dashboard_preset_shape)
+                            migrate_strip_redundant_builtin_presets, migrate_unshadow_builtin_presets,
+                            migrate_dashboard_preset_shape)
 from .startup_registration import is_startup_enabled, enable_startup, disable_startup
 from .desktop_shortcut import create_desktop_shortcut
 from .single_instance import _ensure_single_instance
@@ -132,6 +133,7 @@ class App(tk.Tk):
         # config_store.resolve_dashboard_presets() -- so there's
         # nothing else to seed here.)
         migrated = migrate_strip_redundant_builtin_presets(self.cfg) or migrated
+        migrated = migrate_unshadow_builtin_presets(self.cfg) or migrated
         migrated = migrate_dashboard_preset_shape(self.cfg) or migrated
         if migrated:
             save_config(self.cfg)

@@ -14,8 +14,10 @@ on ScreenEngine (screen_engine.py) instead of ThemeWorker, so switching
 themes here reuses one persistent connection instead of reconnecting.
 """
 import io
+import json
 import os
 import queue
+import re
 import sys
 import threading
 from collections import deque
@@ -52,6 +54,10 @@ class AppController:
         migrated = config_store.migrate_dashboard_elements(self.cfg)
         migrated = config_store.migrate_dashboard_weather_element(self.cfg) or migrated
         migrated = config_store.migrate_strip_redundant_builtin_presets(self.cfg) or migrated
+        # Runs after the strip above: that one removes untouched copies
+        # of built-ins, so whatever's still colliding by the time this
+        # runs is a real customization to rename aside rather than drop.
+        migrated = config_store.migrate_unshadow_builtin_presets(self.cfg) or migrated
         migrated = config_store.migrate_dashboard_preset_shape(self.cfg) or migrated
         if migrated:
             config_store.save_config(self.cfg)
@@ -326,12 +332,20 @@ class AppController:
             "defaults": dashboard_theme.DEFAULT_ELEMENTS,
             "presets": presets,
             "presetThumbnails": self._dashboard_preset_thumbnails(presets),
+            # Which of those names are the app's own read-only presets,
+            # and which built-ins are currently deleted -- the picker
+            # marks the first as built-in (and warns that saving over
+            # one saves a copy instead, see save_dashboard_preset()),
+            # and offers to restore the second.
+            "builtinPresets": list(dashboard_theme.BUILTIN_DASHBOARD_PRESETS),
+            "dismissedBuiltinPresets": list(d.get("dismissed_builtin_presets") or []),
             "stats": {
                 key: {"label": meta["label"], "title": meta["title"]}
                 for key, meta in dashboard_theme.STAT_DEFS.items()
             },
             "background": dict(dashboard_theme.DEFAULT_BACKGROUND, **(d.get("background") or {})),
             "backgroundPresets": dict(dashboard_theme.BACKGROUND_PRESETS),
+            "widgetStyles": dashboard_theme.widget_styles.STYLES,
             # Modes that are a photo, not a tinted procedural draw --
             # "image" (a user's own upload) plus every bundled one
             # (BUNDLED_BACKGROUND_IMAGES) -- so the frontend knows when
@@ -582,16 +596,31 @@ class AppController:
         loadPreset() both fall back to the currently configured global
         background in that case, same as before this existed.
 
-        Always writes into `dashboard.presets`, whether `name` is
-        brand new, an existing saved preset, or one of the app's own
-        built-ins (dashboard_theme.BUILTIN_DASHBOARD_PRESETS) -- saving
-        under a built-in's exact name is how it gets customized: from
-        this point on config_store.resolve_dashboard_presets() prefers
-        this saved copy over the code-defined one of the same name. If
-        that name had previously been deleted (dismissed_builtin_
-        presets), it's un-dismissed here too -- explicitly saving a
-        preset by that name is as clear a signal as a person can give
-        that they want something there again."""
+        Writes into `dashboard.presets`, which holds a person's own
+        presets only. The app's own built-ins (dashboard_theme.
+        BUILTIN_DASHBOARD_PRESETS) are read-only: saving under a
+        built-in's exact name does NOT overwrite it, it saves a copy
+        under a free derived name ("Fusion Core" -> "Fusion Core
+        (custom)", see config_store.free_preset_name()), and the
+        returned "name" says which one it actually used so the caller
+        can report it rather than claiming a save that didn't happen
+        where it said.
+
+        That used to be the opposite: a same-named save shadowed the
+        built-in from then on (config_store.resolve_dashboard_presets()
+        preferred the saved copy), which is a strange bargain -- the
+        only way to tweak a built-in also permanently destroyed your
+        access to the original, and froze that slot against any future
+        app update to it. Requested directly: "default themes shouldn't
+        be modified, like if a user tries to modify them, we create a
+        duplicate of it where the user does his modifications".
+
+        A built-in that was previously deleted stays deleted through
+        this (restore_dismissed_dashboard_presets() is what brings
+        dismissed built-ins back now) -- saving a *copy* of one says
+        nothing about wanting the original back in the picker, unlike
+        the old overwrite, which by definition put something there
+        under that exact name."""
         name = (name or "").strip()
         if not name:
             raise ValueError("preset name can't be empty")
@@ -602,16 +631,16 @@ class AppController:
         with self._lock:
             dashboard_cfg = dict(self.cfg.get("dashboard") or {})
             presets = dict(dashboard_cfg.get("presets") or {})
+            if name in dashboard_theme.BUILTIN_DASHBOARD_PRESETS:
+                name = config_store.free_preset_name(
+                    name, set(presets) | set(dashboard_theme.BUILTIN_DASHBOARD_PRESETS))
             presets[name] = {"elements": elements, "background": background}
             dashboard_cfg["presets"] = presets
-            dismissed = list(dashboard_cfg.get("dismissed_builtin_presets") or [])
-            if name in dismissed:
-                dismissed.remove(name)
-                dashboard_cfg["dismissed_builtin_presets"] = dismissed
             self.cfg["dashboard"] = dashboard_cfg
             config_store.save_config(self.cfg)
             merged = config_store.resolve_dashboard_presets(self.cfg)
-            return {"presets": merged, "thumbnails": self._dashboard_preset_thumbnails(merged)}
+            return {"name": name, "presets": merged,
+                    "thumbnails": self._dashboard_preset_thumbnails(merged)}
 
     def delete_dashboard_preset(self, name):
         """Removes `name` from whatever's actually saved in this
@@ -638,7 +667,152 @@ class AppController:
             self.cfg["dashboard"] = dashboard_cfg
             config_store.save_config(self.cfg)
             presets = config_store.resolve_dashboard_presets(self.cfg)
-            return {"presets": presets, "thumbnails": self._dashboard_preset_thumbnails(presets)}
+            # The dismissed list rides along so the picker can offer
+            # "restore built-ins" the moment one is deleted, without a
+            # second round trip for the whole meta blob.
+            return {"presets": presets, "thumbnails": self._dashboard_preset_thumbnails(presets),
+                    "dismissed": list(dashboard_cfg.get("dismissed_builtin_presets") or [])}
+
+    # ------------------------------------------------------------------ #
+    # Sharing a preset with someone else.
+    #
+    # A preset is already just {elements, background} -- plain JSON --
+    # so the hard part isn't the shape, it's the pictures. Any image in
+    # it (the background, an image element, a clock face) is stored as
+    # an absolute path into this machine's own managed image folder
+    # (image_store.py), which means nothing at all on the machine it's
+    # sent to. Export therefore inlines each referenced image as base64
+    # and drops the path; import writes those bytes back into the
+    # receiving machine's image store and rewrites the paths to point
+    # at the new copies.
+    #
+    # Import deliberately does NOT trust an incoming `image_path`: a
+    # preset file arrives from someone else, and a bare path in one
+    # would otherwise let it point the panel at an arbitrary file on
+    # this disk. Only images that travelled with the file (as base64)
+    # or paths already inside this machine's own image store survive;
+    # anything else is dropped to None, which every renderer here
+    # already treats as "no image" rather than an error.
+    # ------------------------------------------------------------------ #
+    _IMAGE_HOLDERS = "image_path"
+
+    @staticmethod
+    def _preset_image_slots(preset):
+        """Every dict in a preset that can carry an image: its
+        background plus each element. Yielded as the dicts themselves
+        so callers can rewrite them in place."""
+        background = preset.get("background")
+        if isinstance(background, dict):
+            yield background
+        for el in preset.get("elements") or []:
+            if isinstance(el, dict):
+                yield el
+
+    def export_dashboard_preset(self, name):
+        """A preset as a self-contained JSON object, ready to hand to
+        someone else: `{"name", "preset": {"elements", "background"}}`
+        with every referenced image inlined as `image_b64` (+
+        `image_name` for its extension) in place of `image_path`.
+
+        Reads through the merged view, so a built-in exports exactly as
+        well as a saved one -- "send me the one you're using" shouldn't
+        depend on where it happens to live."""
+        presets = config_store.resolve_dashboard_presets(self.cfg)
+        preset = presets.get(name)
+        if preset is None:
+            raise ValueError(f"no such preset: {name}")
+        preset = json.loads(json.dumps(preset))  # deep copy; never mutate the live one
+        for slot in self._preset_image_slots(preset):
+            path = slot.get("image_path")
+            if not path:
+                continue
+            try:
+                with open(path, "rb") as f:
+                    slot["image_b64"] = base64.b64encode(f.read()).decode("ascii")
+                # Send the name without the 8-char content-hash prefix
+                # image_store adds when it takes a copy: that prefix is
+                # our storage detail, not part of the picture's name,
+                # and leaving it on means each export/import round trip
+                # stacks another one ("ab12_ab12_shot.png") and stores
+                # a second identical copy instead of deduping onto the
+                # first.
+                slot["image_name"] = re.sub(r"^[0-9a-f]{8}_", "", os.path.basename(path))
+            except OSError:
+                # The picture is gone from this machine -- export the
+                # layout anyway rather than failing the whole thing;
+                # the recipient gets it with no image, same as they'd
+                # get from a preset that never had one.
+                pass
+            slot["image_path"] = None
+        return {"name": name, "preset": preset}
+
+    def import_dashboard_preset(self, name, preset):
+        """Saves a preset that came from a file (see
+        export_dashboard_preset()) under `name`, materializing any
+        inlined images into this machine's image store first.
+
+        Validates the shape rather than trusting it: `elements` must be
+        a list and `background`, if present, an object -- past that the
+        renderers already skip element types and background modes they
+        don't recognize, which is what lets a preset made by a newer
+        (or just differently-configured) copy of the app still load
+        here instead of erroring. The name goes through
+        save_dashboard_preset(), so importing something called "Fusion
+        Core" lands as a copy rather than overwriting the built-in."""
+        if not isinstance(preset, dict):
+            raise ValueError("preset must be an object")
+        elements = preset.get("elements")
+        if not isinstance(elements, list):
+            raise ValueError("preset needs an \"elements\" list")
+        background = preset.get("background")
+        if background is not None and not isinstance(background, dict):
+            raise ValueError("preset's \"background\" must be an object")
+        preset = json.loads(json.dumps(preset))  # detach from the caller's dict
+        for slot in self._preset_image_slots(preset):
+            blob = slot.pop("image_b64", None)
+            original = slot.pop("image_name", None) or "imported.png"
+            path = slot.get("image_path")
+            if blob:
+                try:
+                    slot["image_path"] = image_store.store_image_bytes(
+                        base64.b64decode(blob), original)
+                    continue
+                except (ValueError, base64.binascii.Error):
+                    # Corrupt or not-an-image payload: drop it and keep
+                    # the rest of the layout, same as a missing file.
+                    slot["image_path"] = None
+                    continue
+            # No image travelled with it: keep a path only if it's one
+            # of ours already (re-importing a file exported here), and
+            # never an arbitrary path chosen by whoever sent it.
+            slot["image_path"] = path if (path and image_store.is_managed(path)) else None
+        return self.save_dashboard_preset(name, preset.get("elements"), preset.get("background"))
+
+    def restore_dismissed_dashboard_presets(self):
+        """Puts every deleted built-in back in the picker by clearing
+        `dashboard.dismissed_builtin_presets` -- the undo for deleting
+        one.
+
+        This exists because built-ins became read-only: deleting one is
+        now the only thing a person can do TO a built-in (everything
+        else copies), and an action with no way back isn't a choice,
+        it's a trap. It used to have an accidental undo -- saving any
+        preset under that exact name un-dismissed it -- which stopped
+        being a thing when that save started creating a copy instead.
+
+        Only touches the dismissed list: a person's own saved presets
+        aren't involved, including one named "<built-in> (custom)" that
+        came from customizing the built-in in the first place."""
+        with self._lock:
+            dashboard_cfg = dict(self.cfg.get("dashboard") or {})
+            restored = list(dashboard_cfg.get("dismissed_builtin_presets") or [])
+            if restored:
+                dashboard_cfg["dismissed_builtin_presets"] = []
+                self.cfg["dashboard"] = dashboard_cfg
+                config_store.save_config(self.cfg)
+            presets = config_store.resolve_dashboard_presets(self.cfg)
+            return {"restored": restored, "presets": presets,
+                    "thumbnails": self._dashboard_preset_thumbnails(presets)}
 
     def _dashboard_preset_thumbnails(self, presets, default_background=None):
         """Renders every saved preset's small preview picture (a

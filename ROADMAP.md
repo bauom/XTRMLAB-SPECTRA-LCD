@@ -2570,6 +2570,238 @@ accurate live backdrop -- fine when every graph had a frame, wrong now
 that a frameless graph is a deliberate choice, so that exception is
 now conditional on `show_frame`.
 
+Next, once those shipped: "defeault themes shouldn't be modified, like
+if a user tries to modify them, we create a duplicate of it where the
+user does his modifications". The one path that could mutate a
+built-in was saving a preset under its exact name -- resolve_dashboard
+_presets() prefers the saved side on a collision, so that saved copy
+shadowed the code-defined preset permanently. That was deliberate once
+(it was *how* you customized a built-in) but it's a bad trade on
+inspection: the only way to tweak a built-in also destroyed your
+access to the original, with nothing able to bring it back, and froze
+that name against every future app update to it -- the exact failure
+the merge-on-read design was introduced to avoid, just arrived at from
+the other direction.
+
+Now `save_dashboard_preset()` checks the name against BUILTIN_DASHBOARD
+_PRESETS and, on a hit, saves under a free derived name instead
+(`config_store.free_preset_name()`: "Fusion Core (custom)", then
+"(custom 2)"), returning the name it actually used -- the frontend
+reports that rather than echoing what was typed, since a save that
+silently lands elsewhere is worse than one that refuses. Saving over
+one of the person's *own* presets still overwrites in place; the rule
+is only about the app's own read-only ones. The picker also warns
+before the save, as soon as the typed name matches a built-in, and
+badges every built-in card.
+
+Two consequences worth handling rather than leaving:
+
+`migrate_unshadow_builtin_presets()` covers configs that already
+shadow a built-in from before this rule -- it renames the saved entry
+to "<name> (custom)" so the customization survives and the built-in
+reappears, and un-dismisses that name if it had also been deleted
+(such a built-in was only ever visible *as* its override, so leaving
+it dismissed would make the preset the person was actually using
+vanish). It runs after migrate_strip_redundant_builtin_presets(),
+which already removes untouched copies, so every collision it sees is
+a genuine customization. Flagged `_unshadowed_builtin_presets_v1` so
+it runs once and doesn't keep undoing a hand-edited config.
+
+And deleting a built-in, now the only thing that can be done *to* one,
+gained a real undo: `restore_dismissed_dashboard_presets()` clears the
+dismissed list, exposed as `POST /api/dashboard/presets/restore_
+builtins` and a "Restore built-ins" button that appears only while
+something is hidden (the delete button itself reads "Hide" on a
+built-in, since that's what it does). This isn't scope creep -- the
+old behavior had an accidental undo (saving anything under that name
+un-dismissed it) that this change removes, so without a replacement
+"delete" would have become a one-way door.
+
+Verified in the browser harness: the pre-save warning appears while
+typing a built-in's name; saving it leaves the built-in in place and
+produces "Fusion Core (custom)", then "(custom 2)" on a second save;
+saving over a user's own preset still overwrites rather than piling up
+copies; hiding a built-in removes it and offers the restore, which
+brings it back and hides the button again; no console errors. The
+migration and the naming rule were also exercised directly against a
+synthetic config (a customized + dismissed "Deep Space"): the
+customization ends up under "Deep Space (custom)", the built-in is
+identity-equal to the code-defined one again, and a second migration
+run is a no-op.
+
+Then, with a screenshot of the canvas showing "Neon Horizon": "the
+graphs keeps getting highlighted on their own (not selected) like
+network graph in the image". The graph sat under a gradient-filled box
+with "NETWORK" across the middle, on top of an otherwise-correct live
+render, with nothing selected.
+
+That box was the editor's mockup overlay. Every element type hides its
+mockup once `hasAccurateBackdrop` is true -- graphs were the one
+exception, unconditionally drawing theirs (the previous round narrowed
+that exception to `show_frame !== false`, which helped the new card
+themes but left every ordinary graph exactly as it was). The exception
+dated from the reasoning that the SVG layer can't plot the line, so
+the box was the only thing making the region findable and draggable.
+Both halves were false: the backdrop it defers to is a full render of
+the panel -- the graph's frame, title AND line are all in it -- and
+the mockup isn't a hairline outline but a filled box (0.55 alpha when
+the element has a gradient) with the element's name centered in it, so
+"defer to the real thing" turned into "paint a colored slab over the
+real thing". Removed the exception; graphs follow the same rule as
+everything else now.
+
+Dragging never depended on the mockup: the branch that renders it
+falls through to a transparent hit rect of the same geometry when it's
+hidden, which is what carries the pointer handler. Verified all four
+states in the harness rather than just the reported one -- deselected
+over the live frame (hidden), selected (shown), deselected again
+(hidden), and with the mock panel reporting disconnected so there's no
+accurate backdrop at all (shown, which is the case the original
+exception was really protecting) -- plus a real pointer drag on the
+hidden graph, grabbed from its own hit rect mapped out of SVG user
+units, which moves it and re-arms Save.
+
+Then: "add a button for creating a new custom theme, we only have
+duplicate now". Correct, and a real gap rather than a missing
+shortcut: every path to a new preset started from an existing one.
+Duplicate clones a card; "Save current layout as preset" captures
+whatever is on the canvas, which after the previous round's changes is
+usually a built-in someone just loaded. So "build my own" actually
+meant "load someone else's and delete its elements one at a time" --
+and now that built-ins are read-only, the deleting-down-to-nothing
+version of that is the *only* version.
+
+`createNewTheme()` saves an empty preset under an auto-numbered "New
+theme" name, then puts the canvas into editing it -- the same two
+moves loadPreset() makes (commit the elements, keep the background
+draft), minus the lookup, since an empty element list and the
+already-staged background are known without one. It also prefills the
+"Save current layout as preset" box with the new name, so the obvious
+next save lands back in that card instead of creating a sibling;
+that's only safe because saving over one of your *own* presets
+overwrites in place (the copy-instead behavior is built-ins only).
+
+Empty rather than seeded with DEFAULT_ELEMENTS on purpose: "Reset to
+defaults" in the toolbar already puts that layout on the canvas, so
+seeding it would make this a second Duplicate with fewer options. The
+background draft does carry over, because a truly blank start is a
+black rectangle, which isn't a useful canvas. Checked that an empty
+preset survives the parts of the app that assume elements exist --
+render_preset_thumbnail([]) and render_live_preview([]) both render
+the background cleanly, and _dashboard_preset_thumbnails() returns a
+real data URI for it, so the new card shows its background rather than
+the "No preview" fallback.
+
+Verified in the harness: the button adds exactly one card and leaves
+the other 16 alone, the canvas comes up with an empty element list,
+the name box is prefilled, adding a gauge and saving under that name
+updates the same card instead of creating a second, and a second click
+names the next one "New theme 2".
+
+**Theme import/export**, which arrived as a concrete errand: "there is
+theme created by my friend can u import it?", with a .json and a PNG.
+The file turned out to be a valid preset for *this* app -- built
+entirely on the features added over the previous rounds (`font`,
+`plate`/`plate_opacity`/`plate_pad`/`plate_radius`, `show_title`/
+`show_value`, `track_color`, `border`, `dim`), 22 elements, every stat
+and font it names real -- with one snag: its background was `"mode":
+"nocturne"`, a bundled mode this app doesn't have, because the PNG was
+what that mode stood for. Imported it by hand (image copied into the
+managed store under image_store.py's own sha1-prefixed naming, preset
+injected into app_config.json with `mode: "image"` pointing at the
+copy, config backed up first), then built the feature so the next one
+doesn't need me.
+
+Export/import as a pair, because sharing only works if both ends
+exist and the friend's file had to be produced by hand for lack of
+one. The layout was never the hard part -- a preset is already plain
+JSON. The images are: every picture a preset references lives at an
+absolute path into the *local* managed image folder, which is
+meaningless on another machine, and that single fact is what made
+"send someone your theme" a manual operation. So export inlines each
+referenced image as base64 (`image_b64` + `image_name`, path nulled)
+and import materializes them back into the receiving machine's store
+via `image_store.store_image_bytes()`, repointing the preset at the
+new copies.
+
+Import treats the file as untrusted, which matters more than it might
+look: a preset file is something a person got from someone else, and
+an `image_path` in one is an instruction to render an arbitrary file
+from the receiving disk on a screen. So a path that didn't travel with
+the file only survives if `image_store.is_managed()` already claims it
+(the re-import-your-own-export case); everything else becomes None,
+which every renderer here already handles as "no image". Shape is
+checked too (`elements` a list, `background` an object or absent),
+while unknown element types and background modes are deliberately left
+alone -- the renderers skip what they don't recognize, which is what
+lets a file from a newer or differently-configured copy still load.
+Names route through save_dashboard_preset(), so an import called
+"Fusion Core" copies rather than overwrites, and the filename is
+tidied into a title ("nocturne_cathedral.json" -> "Nocturne
+Cathedral") unless it already carries capitals, in which case it's
+left as sent.
+
+One bug found by testing the round trip rather than a single
+direction: export sent `os.path.basename(path)` as the image name,
+which still had the 8-char content-hash prefix image_store had added
+on storage, so each cycle stacked another (`ab12_ab12_shot.png`) and,
+because the name differed, stored a fresh identical copy every time.
+Export now strips that prefix; verified stable over three round trips
+with one file on disk.
+
+Verified in the harness: Export appears in the card menu and downloads
+a .json with images inlined; re-importing it restores the preset; the
+friend's real file imports cleanly; malformed JSON and wrong-shaped
+JSON each surface their own error instead of failing quietly.
+
+**CPU clock, and a new Volume stat.** "CPU Clock is always showing as
+3.4G which isn't accurate, can you verify that, add a new stats to
+everything to show pc volume."
+
+The clock was never a display bug. `get_cpu_freq_ghz()` returned
+`psutil.cpu_freq().current`, and on Windows psutil gets that from
+`CallNtPowerInformation(ProcessorInformation)`, whose `CurrentMhz` on
+current hardware is simply the nominal clock -- a constant. So the
+stat had been showing the base frequency the whole time, on a machine
+whose own vendor app was reading 5.5GHz simultaneously (visible in the
+screenshots from the theme rounds). Replaced with the
+`\Processor Information(_Total)\% Processor Performance` counter times
+the base clock: that counter is a percentage *of base*, exceeds 100
+under boost, and is the same quantity Task Manager's "Speed" field
+shows. Read through PDH by ctypes rather than adding pywin32/WMI --
+`PdhOpenQueryW` + `PdhAddEnglishCounterW` (the English variant so a
+localized Windows doesn't break it) + two collections, with the query
+kept open and the priming sample returning None. psutil stays as the
+fallback, which keeps Linux correct (its `current` genuinely is live)
+and covers any Windows SKU missing the counter. Sampled at 1Hz, not
+per frame.
+
+Worth being explicit about the limit here: this sandbox is Linux and
+the device bridge is a Linux VM with no access to Windows hardware, so
+*I can't verify the reading on the actual machine* -- only that the
+fallback path behaves and the code runs. That's what
+`scripts/check_sensors.py` is for: it prints psutil's number, the perf
+counter, and the resulting GHz five times a second apart so the fix
+can be checked against Task Manager directly, rather than declared
+fixed from here.
+
+The Volume stat is the first entry in STAT_DEFS that isn't about load
+or heat -- and the only one the person changes on purpose rather than
+watches. `get_volume_percent()` reads the default playback endpoint's
+scalar level through pycaw (the slider value, not the master dB level,
+which is a different curve and not what anyone means by "my volume is
+at 40%"), reporting 0 while muted. The endpoint is resolved once and
+cached, since that path goes through COM device enumeration; a device
+disappearing under it drops the cache so the next read re-resolves
+whatever the default is now, and the render thread gets a
+`CoInitialize()` since it's not the thread COM was set up on. pycaw is
+optional, like nvidia-ml-py and winsdk before it -- missing means that
+one stat reads "--". Registered in STAT_DEFS, which is all it takes:
+every element type reads stats through the same registry, and the
+frontend's stat picker is built from `dashboard_meta()["stats"]`, so
+gauge/bar/graph/text and the picker all got it with no further wiring.
+Verified by rendering all four element types bound to it.
+
 ### Phase 7 — Packaging and cutover
 
 **Cutover done early (source-run only), at the user's explicit

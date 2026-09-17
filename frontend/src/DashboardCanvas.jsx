@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import * as api from "./api.js";
 import Collapsible from "./Collapsible.jsx";
+import { StyledGaugePreview, StyledBoxPreview, resolveWidgetStyle, widgetFont } from "./StyledWidgets.jsx";
 
 // The dashboard design canvas (ROADMAP.md Phase 5) -- drag/resize gauge
 // elements over the live panel frame, edit their stat/color/opacity in a
@@ -386,8 +387,9 @@ function FontFamilyControl({ selected, updateSelected, meta }) {
     <div className="row">
       <label className="grow">
         Font
-        <select value={selected.font || "default"}
-                onChange={(e) => updateSelected({ font: e.target.value === "default" ? null : e.target.value })}>
+        <select value={selected.font || ""}
+                onChange={(e) => updateSelected({ font: e.target.value || null })}>
+          <option value="">Use theme font</option>
           {Object.entries(families).map(([key, f]) => (
             <option key={key} value={key}>{f.label}</option>
           ))}
@@ -662,6 +664,8 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
   const savedBackgroundRef = useRef(null);
   const dragRef = useRef(null); // {id, mode: 'move'|'resize', beforeElements}
   const svgRef = useRef(null);
+  // The hidden <input type="file"> behind the "Import theme" button.
+  const importInputRef = useRef(null);
 
   const load = useCallback(() => {
     setError(null);
@@ -1019,6 +1023,12 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
     if (!elements || !meta) return;
     const el = makeElement(type, elements, meta);
     if (!el) return;
+    if (meta.widgetStyles?.[bgDraft?.widget_style]) {
+      el.color = null;
+      el.color2 = null;
+      el.font = null;
+      el.gradient = false;
+    }
     commit([...elements, el]);
     setSelectedId(el.id);
   };
@@ -1217,6 +1227,13 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
     );
   };
 
+  // The app's own presets (dashboard_theme.BUILTIN_DASHBOARD_PRESETS,
+  // sent along in meta) are read-only: they can be loaded, duplicated
+  // and hidden, but never written over -- saving under one of their
+  // names saves a copy instead. Used for the card badge, the
+  // save-name warning, and the wording of a delete.
+  const isBuiltinPreset = (name) => (meta?.builtinPresets || []).includes(name);
+
   const saveAsPreset = () => {
     const name = presetName.trim();
     if (!name) return;
@@ -1229,7 +1246,27 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
       (r) => {
         setMeta((m) => ({ ...m, presets: r.presets, presetThumbnails: r.thumbnails }));
         setPresetName("");
-        setStatus(`Saved preset "${name}".`);
+        // The backend decides the final name: saving under a built-in's
+        // name saves a copy ("Fusion Core (custom)") rather than
+        // overwriting a read-only preset, so report what it actually
+        // did instead of echoing what was typed.
+        const saved = r.name || name;
+        setStatus(saved === name
+          ? `Saved preset "${saved}".`
+          : `"${name}" is a built-in preset and can't be overwritten -- saved your version as "${saved}".`);
+      },
+      (e) => setError(e.message)
+    );
+  };
+
+  const restoreBuiltins = () => {
+    api.restoreBuiltinDashboardPresets().then(
+      (r) => {
+        setMeta((m) => ({ ...m, presets: r.presets, presetThumbnails: r.thumbnails,
+                           dismissedBuiltinPresets: [] }));
+        setStatus(r.restored?.length
+          ? `Restored ${r.restored.length} built-in preset${r.restored.length === 1 ? "" : "s"}.`
+          : "No deleted built-in presets to restore.");
       },
       (e) => setError(e.message)
     );
@@ -1260,6 +1297,112 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
     // used to need a second, separate "Save background" click too,
     // which this message wrongly implied was required either way.
     setStatus(`Loaded preset "${name}" -- Save layout to apply.`);
+  };
+
+  // Starts a theme from nothing: saves an empty preset and drops the
+  // canvas straight into editing it. Until this existed, every preset
+  // was necessarily derived from another one -- Duplicate copies a
+  // card, and "Save current layout as preset" bottles up whatever
+  // happens to be on the canvas -- so "I want to build one of my own"
+  // meant first dismantling somebody else's layout element by element.
+  //
+  // Deliberately empty rather than seeded with the default 8 gauges:
+  // "Reset to defaults" in the toolbar above already puts that layout
+  // on the canvas for anyone who wants to start from it, so seeding it
+  // here would just make this a second, worse Duplicate. The one thing
+  // it does carry over is the background draft currently in effect --
+  // starting on a black rectangle would be a strange definition of
+  // "blank", and the Background section right below changes it.
+  const createNewTheme = () => {
+    const existing = new Set(Object.keys(meta.presets || {}));
+    let name = "New theme";
+    let n = 2;
+    while (existing.has(name)) {
+      name = `New theme ${n}`;
+      n += 1;
+    }
+    api.saveDashboardPreset(name, [], bgDraft).then(
+      (r) => {
+        const saved = r.name || name;
+        setMeta((m) => ({ ...m, presets: r.presets, presetThumbnails: r.thumbnails }));
+        // Same two moves loadPreset() makes, minus the lookup: this
+        // preset's elements are empty by construction and its
+        // background is the draft that's already staged.
+        commit([]);
+        setSelectedId(null);
+        // Prefilled so "Save as preset" updates this card rather than
+        // spawning another one -- saving over your own preset
+        // overwrites in place (built-ins are the ones that copy).
+        setPresetName(saved);
+        setStatus(`Started "${saved}" -- an empty theme. Add elements above, then Save layout to put it on the panel, or Save as preset to update this card.`);
+      },
+      (e) => setError(e.message)
+    );
+  };
+
+  // Export writes the preset out as a .json the user can send to
+  // someone else; the backend inlines its images first so the file
+  // stands on its own (see export_dashboard_preset()). Downloading is
+  // done the only way a browser can -- a Blob URL behind a synthetic
+  // <a download> click.
+  const exportPreset = (name) => {
+    setPresetMenuOpen(null);
+    api.exportDashboardPreset(name).then(
+      (r) => {
+        const blob = new Blob([JSON.stringify(r.preset, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `${name.replace(/[^\w.-]+/g, "_").replace(/^_|_$/g, "") || "theme"}.json`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        // Revoked on the next tick rather than immediately -- some
+        // browsers cancel an in-flight download if the URL dies first.
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        setStatus(`Exported "${name}" -- the file includes its background image, so it works as-is on another machine.`);
+      },
+      (e) => setError(e.message)
+    );
+  };
+
+  // Import reads the picked .json here (a file input is the only way a
+  // browser hands over file contents) and posts it; the backend
+  // validates the shape, writes any inlined images into its own image
+  // store, and ignores image paths that didn't travel with the file.
+  const importPresetFile = (file) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onerror = () => setError(`Couldn't read "${file.name}".`);
+    reader.onload = () => {
+      let parsed;
+      try {
+        parsed = JSON.parse(reader.result);
+      } catch (err) {
+        setError(`"${file.name}" isn't valid JSON: ${err.message}`);
+        return;
+      }
+      // Name it after the file, since a preset file carries a layout,
+      // not a name -- the backend uniquifies it if that's taken.
+      // "nocturne_cathedral.json" reads better in the picker as
+      // "Nocturne Cathedral", so separators become spaces and an
+      // all-lowercase name gets title-cased. A name that already has
+      // capitals ("GPU Monitor") is left exactly as the sender wrote
+      // it rather than being "helpfully" mangled into "Gpu Monitor".
+      let base = file.name.replace(/\.json$/i, "").replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
+      if (base && base === base.toLowerCase()) {
+        base = base.replace(/\b\w/g, (ch) => ch.toUpperCase());
+      }
+      base = base || "Imported theme";
+      api.importDashboardPreset(base, parsed).then(
+        (r) => {
+          setMeta((m) => ({ ...m, presets: r.presets, presetThumbnails: r.thumbnails }));
+          setStatus(`Imported "${r.name || base}". Click its card to load it.`);
+        },
+        (e) => setError(`Couldn't import "${file.name}": ${e.message}`)
+      );
+    };
+    reader.readAsText(file);
   };
 
   const duplicatePreset = (name) => {
@@ -1306,8 +1449,11 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
     setPresetMenuOpen(null);
     api.deleteDashboardPreset(name).then(
       (r) => {
-        setMeta((m) => ({ ...m, presets: r.presets, presetThumbnails: r.thumbnails }));
-        setStatus(`Deleted preset "${name}".`);
+        setMeta((m) => ({ ...m, presets: r.presets, presetThumbnails: r.thumbnails,
+                           dismissedBuiltinPresets: r.dismissed ?? m.dismissedBuiltinPresets }));
+        setStatus(isBuiltinPreset(name)
+          ? `Hid built-in preset "${name}" -- "Restore built-ins" below brings it back.`
+          : `Deleted preset "${name}".`);
       },
       (e) => setError(e.message)
     );
@@ -1323,7 +1469,10 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
   }
 
   const selected = elements.find((el) => el.id === selectedId) || null;
-  const ordered = [...elements].sort((a, b) => (a.z ?? 0) - (b.z ?? 0));
+  const styledSelected = selected ? resolveWidgetStyle(selected, bgDraft, meta.widgetStyles) : null;
+  const usesWidgetStyle = !!meta.widgetStyles?.[styledSelected?.widget_style];
+  const ordered = elements.map((el) => resolveWidgetStyle(el, bgDraft, meta.widgetStyles))
+    .sort((a, b) => (a.z ?? 0) - (b.z ?? 0));
   // Includes a staged-but-unsaved background now too, not just
   // elements -- Save layout persists both together (see its own
   // comment), so the button's enabled/attention state needs to reflect
@@ -1543,7 +1692,8 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
                   )}
                   {showMockup ? (
                     <text x={x} y={y} textAnchor={anchor} dominantBaseline="middle"
-                          fontSize={fontSize} fill={color} opacity={el.opacity ?? 1}
+                          fontSize={fontSize} fontFamily={widgetFont(el)} fontWeight={widgetFont(el) ? (el.bold ? 650 : 450) : undefined}
+                          fill={color} opacity={el.opacity ?? 1}
                           onPointerDown={onPointerDownGauge(el)} style={{ cursor: "move", userSelect: "none" }}>
                       {previewText}
                     </text>
@@ -1581,7 +1731,7 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
               const h = (el.height ?? (el.type === "media" ? 0.52 : el.type === "weather" ? 0.46 : el.type === "bar" ? 0.12 : 0.14)) * REF_H;
               const x0 = el.x * REF_W - w / 2;
               const y0 = el.y * REF_H - h / 2;
-              const accent = el.type === "graph" || el.type === "bar" ? accentFor(el)
+              const accent = meta.widgetStyles?.[el.widget_style] || el.type === "graph" || el.type === "bar" ? accentFor(el)
                 : el.type === "media" ? ACCENT_GPU : el.type === "weather" ? "rgb(255, 200, 60)" : "rgb(150, 170, 200)";
               const label = el.type === "graph" || el.type === "bar" ? (meta.stats[el.stat]?.title || el.stat)
                 : el.type === "media" ? "NOW PLAYING" : el.type === "weather" ? "WEATHER" : "PICK AN IMAGE BELOW";
@@ -1662,18 +1812,24 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
               // goes false again and the mockup goes back to deferring
               // to the real frame.
               const overLiveFrame = hasAccurateBackdrop;
-              // A graph normally keeps its mockup box visible even over
-              // an accurate backdrop -- the SVG overlay can't draw the
-              // plotted line itself, so the box is the only thing
-              // making an otherwise-empty region locatable/draggable.
-              // A graph explicitly set frameless (show_frame: false, as
-              // the card-based presets do, since their background art
-              // already draws the plot well) is the exception: forcing
-              // a frame and a title label on top of a backdrop that
-              // deliberately has neither is the same double-render the
-              // other mockup gates exist to avoid.
-              const graphNeedsBox = el.type === "graph" && el.show_frame !== false;
-              const showMockup = graphNeedsBox || isSelected || !overLiveFrame || forceAllMockups;
+              // Graphs used to be exempt from all of this and draw their
+              // mockup unconditionally, on the theory that the SVG
+              // overlay can't plot the line itself so the box was the
+              // only thing making the region locatable. That was wrong
+              // twice over: the backdrop this defers to (the panel's
+              // live frame, or the live-rendered preview of an unsaved
+              // edit) draws the graph in full -- frame, title AND line
+              // -- so there's nothing to locate that isn't already
+              // there; and the mockup isn't a faint outline, it's a
+              // gradient-filled box with the element's name across the
+              // middle, so forcing it on top of that real render read
+              // as the graph highlighting itself at random. Reported
+              // exactly that way. The transparent hit rect below still
+              // covers dragging when the mockup is hidden, and
+              // `!overLiveFrame` still brings it back whenever there's
+              // no accurate backdrop to defer to.
+              const showMockup = isSelected || !overLiveFrame || forceAllMockups;
+              const styledBox = !!meta.widgetStyles?.[el.widget_style] && ["bar", "media"].includes(el.type);
               return (
                 <g key={el.id}>
                   {imageUrl && (
@@ -1693,6 +1849,13 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
                            preserveAspectRatio={preserveAspectRatio} clipPath={`url(#${clipId})`}
                            opacity={el.opacity ?? 1}
                            onPointerDown={onPointerDownGauge(el)} style={{ cursor: "move" }} />
+                  ) : showMockup && styledBox ? (
+                    <g>
+                      <StyledBoxPreview el={el} x={x0} y={y0} w={w} h={h} title={label} />
+                      <rect x={x0} y={y0} width={w} height={h} fill="transparent"
+                            stroke={isSelected ? "#ffd85e" : "none"} strokeDasharray="6 3"
+                            onPointerDown={onPointerDownGauge(el)} style={{ cursor: "move" }} />
+                    </g>
                   ) : showMockup ? (
                     <rect x={x0} y={y0} width={w} height={h}
                           fill={boxFill}
@@ -1713,7 +1876,7 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
                           strokeDasharray={isSelected ? "6 3" : undefined}
                           style={{ pointerEvents: "none" }} />
                   )}
-                  {!imageUrl && showMockup && (
+                  {!imageUrl && showMockup && !styledBox && (
                     <text x={x0 + w / 2} y={y0 + h / 2} textAnchor="middle" dominantBaseline="middle"
                           fill="#fff" fontSize={12} style={{ pointerEvents: "none" }}>
                       {label}
@@ -1917,7 +2080,7 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
                     </rect>
                   ) : (
                     <text x={x} y={y} textAnchor="middle" dominantBaseline="middle"
-                          fontSize={fontSize} fill={clockColor} opacity={el.opacity ?? 1}
+                          fontSize={fontSize} fontFamily={widgetFont(el)} fill={clockColor} opacity={el.opacity ?? 1}
                           onPointerDown={onPointerDownGauge(el)} style={{ cursor: "move", userSelect: "none" }}>
                       {sample}
                     </text>
@@ -1955,7 +2118,14 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
             return (
               <g key={el.id}>
                 {ringGradDefs && <defs>{ringGradDefs}</defs>}
-                {showMockup ? (
+                {showMockup && !!meta.widgetStyles?.[el.widget_style] ? (
+                  <g>
+                    <StyledGaugePreview el={el} title={title} cx={cx} cy={cy} r={r} />
+                    <circle cx={cx} cy={cy} r={r+6} fill="transparent"
+                            stroke={isSelected ? "#ffd85e" : "none"} strokeDasharray="6 3"
+                            onPointerDown={onPointerDownGauge(el)} style={{ cursor: "move" }} />
+                  </g>
+                ) : showMockup ? (
                   <circle
                     cx={cx}
                     cy={cy}
@@ -1973,7 +2143,7 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
                   <circle cx={cx} cy={cy} r={r} fill="transparent"
                           onPointerDown={onPointerDownGauge(el)} style={{ cursor: "move" }} />
                 )}
-                {showMockup && (
+                {showMockup && !meta.widgetStyles?.[el.widget_style] && (
                   <text x={cx} y={cy} textAnchor="middle" dominantBaseline="middle"
                         fill="#fff" fontSize={Math.max(10, r * 0.28)} style={{ pointerEvents: "none" }}>
                     {title}
@@ -2021,6 +2191,37 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
 
           {selected && (
         <div className="canvas-props">
+          {["text", "clock", "gauge", "bar", "media", "graph"].includes(selected.type) && (
+            <div className="row">
+              <label>
+                Widget appearance
+                <select value={selected.widget_style || ""}
+                        onChange={(e) => updateSelected({ widget_style: e.target.value || null })}>
+                  <option value="">Use theme style</option>
+                  <option value="default">Default</option>
+                  {Object.entries(meta.widgetStyles || {}).map(([key, spec]) => (
+                    <option key={key} value={key}>{spec.label}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          )}
+          {!!meta.widgetStyles?.[styledSelected.widget_style] && ["gauge", "bar", "media"].includes(selected.type) && (
+            <>
+              <FontFamilyControl selected={selected} updateSelected={updateSelected} meta={meta} />
+              <div className="row">
+                {[["color", "Accent"], ["ornament_color", "Metal"], ["text_color", "Text"]].map(([key, label]) => (
+                  <label key={key}>{label}
+                    <input type="color" value={rgbToHex(styledSelected[key])}
+                           onChange={(e) => updateSelected({ [key]: hexToRgb(e.target.value) })} />
+                  </label>
+                ))}
+                <button onClick={() => updateSelected({color: null, ornament_color: null, text_color: null, font: null})}>
+                  Use theme colors and font
+                </button>
+              </div>
+            </>
+          )}
           {selected.type === "text" && (
             <>
               <div className="row">
@@ -2201,11 +2402,11 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
                        value={Math.round((selected.opacity ?? 1) * 100)}
                        onChange={(e) => updateSelected({ opacity: Number(e.target.value) / 100 })} />
               </label>
-              <label className="row-inline">
+              {!usesWidgetStyle && <label className="row-inline">
                 <input type="checkbox" checked={!!selected.show_knob}
                        onChange={(e) => updateSelected({ show_knob: e.target.checked })} />
                 Show knob
-              </label>
+              </label>}
               {/* Turn both off to use the bar as a bare meter and put
                   the label/reading in your own text elements instead
                   -- how the card-based presets lay out a "LOAD ... 42%"
@@ -2223,11 +2424,11 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
             </div>
           )}
 
-          {selected.type === "bar" && (
+          {selected.type === "bar" && !usesWidgetStyle && (
             <GradientFillControl selected={selected} updateSelected={updateSelected} />
           )}
 
-          {selected.type === "bar" && selected.gradient && (
+          {selected.type === "bar" && selected.gradient && !usesWidgetStyle && (
             <div className="row">
               <span className="hint">
                 The color at any point on the bar stays put as the value changes, only how
@@ -2380,7 +2581,7 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
                         type="text"
                         value={npDraft.not_playing_message || ""}
                         onChange={(e) => updateNpDraft({ not_playing_message: e.target.value })}
-                        placeholder={npDraft.default_message}
+                        placeholder={meta.widgetStyles?.[styledSelected.widget_style] ? "Awaiting Spotify" : npDraft.default_message}
                       />
                     </label>
                   </div>
@@ -2647,23 +2848,23 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
                   Show title
                 </label>
               </div>
-              <div className="row">
+              {!usesWidgetStyle && <div className="row">
                 <label className="row-inline">
                   <input
                     type="checkbox"
-                    checked={selected.color !== null}
+                    checked={selected.color != null}
                     onChange={(e) => updateSelected({ color: e.target.checked ? hexToRgb("#ffffff") : null })}
                   />
                   Custom color
                 </label>
-                {selected.color !== null && (
+                {selected.color != null && (
                   <input
                     type="color"
                     value={rgbToHex(selected.color)}
                     onChange={(e) => updateSelected({ color: hexToRgb(e.target.value) })}
                   />
                 )}
-              </div>
+              </div>}
               {/* Gauge used to only ever offer exactly one extra color
                   (the old `color2` field, ROADMAP.md Phase 6) sweeping
                   the ring corner-to-corner -- upgraded to the same
@@ -2678,13 +2879,13 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
                   case, including its "derive from left/right position"
                   default when left unchecked, which this component's
                   own plain `color` fallback doesn't know how to do. */}
-              <GradientFillControl selected={selected} updateSelected={updateSelected}
+              {!usesWidgetStyle && <GradientFillControl selected={selected} updateSelected={updateSelected}
                                     defaultColor={[0, 220, 255]} showSolidColorWhenOff={false}
                                     directionOptions={[
                                       ["diagonal", "Diagonal"],
                                       ["horizontal", "Left → Right"],
                                       ["vertical", "Top → Bottom"],
-                                    ]} />
+                                    ]} />}
               <div className="row">
                 <label>
                   X %
@@ -2733,9 +2934,9 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
                   </label>
                   <label>
                     Height %
-                    <input type="number" min={4} max={90} style={{ width: "5em" }}
+                    <input type="number" min={selected.type === "bar" ? 1 : 4} max={90} style={{ width: "5em" }}
                            value={Math.round((selected.height ?? (selected.type === "media" ? 0.52 : selected.type === "weather" ? 0.46 : selected.type === "bar" ? 0.12 : selected.type === "clock" ? 0.22 : 0.14)) * 100)}
-                           onChange={(e) => updateSelected({ height: clamp(Number(e.target.value) / 100, 0.04, 0.9) })} />
+                           onChange={(e) => updateSelected({ height: clamp(Number(e.target.value) / 100, selected.type === "bar" ? 0.01 : 0.04, 0.9) })} />
                   </label>
                 </>
               )}
@@ -2759,6 +2960,16 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
       {bgDraft && (
         <Collapsible id="dashboard-background" title="Background" defaultOpen={false} as="div" className="canvas-props">
           <div className="row">
+            <label>
+              Widget style
+              <select value={bgDraft.widget_style || "default"}
+                      onChange={(e) => updateBgDraft({ widget_style: e.target.value })}>
+                <option value="default">Default</option>
+                {Object.entries(meta.widgetStyles || {}).map(([key, spec]) => (
+                  <option key={key} value={key}>{spec.label}</option>
+                ))}
+              </select>
+            </label>
             <label>
               Style
               <select
@@ -2820,14 +3031,39 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
       )}
 
       <div className="preset-picker">
-        <span className="preset-picker-label">Presets</span>
+        <div className="preset-picker-head">
+          <span className="preset-picker-label">Presets</span>
+          <div className="preset-head-actions">
+            {/* A file input is the only way a browser will hand over a
+                file's contents, so the visible button just forwards to
+                a hidden one. */}
+            <input type="file" accept="application/json,.json" ref={importInputRef}
+                   style={{ display: "none" }}
+                   onChange={(e) => {
+                     importPresetFile(e.target.files?.[0]);
+                     e.target.value = "";  // so picking the same file twice still fires
+                   }} />
+            <button className="preset-new" onClick={() => importInputRef.current?.click()}
+                    title="Import a theme someone shared with you (.json)">
+              Import theme
+            </button>
+            <button className="preset-new" onClick={createNewTheme}
+                    title="Start an empty theme and edit it here">
+              + New theme
+            </button>
+          </div>
+        </div>
         {Object.keys(meta.presets || {}).length === 0 ? (
-          <p className="hint">No saved presets yet -- save the current layout below to create one.</p>
+          <p className="hint">
+            No saved presets yet -- "+ New theme" starts an empty one, or build a layout
+            above and save it below.
+          </p>
         ) : (
           <div className="preset-grid">
             {Object.keys(meta.presets || {}).map((name) => {
               const thumb = meta.presetThumbnails?.[name];
               const armed = presetPendingDelete === name;
+              const builtin = isBuiltinPreset(name);
               return (
                 <div key={name} className="preset-card">
                   <button
@@ -2847,7 +3083,17 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
                     )}
                   </button>
                   <div className="preset-card-footer">
-                    <span className="preset-card-name" title={name}>{name}</span>
+                    <span className="preset-card-name"
+                          title={builtin
+                            ? `${name} -- built in, read-only. Editing it saves a copy.`
+                            : name}>
+                      {name}
+                      {/* Marks a preset that belongs to the app rather
+                          than to this config: it can be loaded,
+                          duplicated and hidden, but never written
+                          over. */}
+                      {builtin && <span className="preset-card-badge" title="Built-in preset (read-only)">◆</span>}
+                    </span>
                     <div className="preset-card-actions" data-preset-menu>
                       <button
                         className="preset-card-menu-toggle"
@@ -2870,12 +3116,24 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
                             Duplicate
                           </button>
                           <button
+                            className="preset-card-duplicate"
+                            data-preset-menu
+                            onClick={() => exportPreset(name)}
+                            title={`Save "${name}" as a .json file you can share`}
+                          >
+                            Export
+                          </button>
+                          <button
                             className={`preset-card-delete${armed ? " confirm" : ""}`}
                             data-preset-menu
                             onClick={() => deletePreset(name)}
-                            title={armed ? "Click again to confirm" : `Delete "${name}"`}
+                            title={armed
+                              ? "Click again to confirm"
+                              : builtin
+                                ? `Hide "${name}" -- it's built in, so this can be undone with "Restore built-ins"`
+                                : `Delete "${name}"`}
                           >
-                            {armed ? "Confirm?" : "Delete"}
+                            {armed ? "Confirm?" : builtin ? "Hide" : "Delete"}
                           </button>
                         </div>
                       )}
@@ -2887,6 +3145,15 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
           </div>
         )}
       </div>
+      {(meta.dismissedBuiltinPresets || []).length > 0 && (
+        <div className="row">
+          <span className="hint grow">
+            {(meta.dismissedBuiltinPresets || []).length} built-in preset
+            {(meta.dismissedBuiltinPresets || []).length === 1 ? " is" : "s are"} hidden.
+          </span>
+          <button onClick={restoreBuiltins}>Restore built-ins</button>
+        </div>
+      )}
       <div className="row">
         <label className="grow">
           Save current layout as preset
@@ -2895,6 +3162,15 @@ export default function DashboardCanvas({ frameUrl, connected, dashboardRunning 
         </label>
         <button onClick={saveAsPreset} disabled={!presetName.trim()}>Save as preset</button>
       </div>
+      {/* Says so before the save rather than after: a built-in can't be
+          overwritten, so this name will come back as a copy. */}
+      {isBuiltinPreset(presetName.trim()) && (
+        <p className="hint">
+          "{presetName.trim()}" is a built-in preset -- built-ins are read-only, so this
+          saves your version as a separate copy ("{presetName.trim()} (custom)") and leaves
+          the original alone.
+        </p>
+      )}
 
       {status && <p className="hint settings-saved">{status}</p>}
       {error && <p className="error">{error}</p>}

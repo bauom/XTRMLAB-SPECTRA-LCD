@@ -162,14 +162,27 @@ def resolve_dashboard_presets(cfg):
     app_config.json only ever holds what a person actually chose to
     save.
 
-    A name that exists in both wins from the saved side -- the person
-    has customized that built-in (or reused its name for their own),
-    and their version is the one they'll see and can keep editing.
+    The two sides no longer collide by design: a built-in is read-only,
+    and an attempt to save over one lands under a derived name instead
+    (see AppController.save_dashboard_preset() and
+    migrate_unshadow_builtin_presets() below). Saving over a built-in
+    used to be *how* you customized it -- the saved copy shadowed the
+    code-defined one from then on -- which quietly cost you the
+    original: there was no way back to it, and an app update that
+    improved that preset never reached you. A saved entry that still
+    shares a built-in's name (only reachable by hand-editing
+    app_config.json now) is still preferred here rather than ignored:
+    hiding a person's own saved data because of a name clash would be
+    worse than the clash itself.
+
     `dashboard.dismissed_builtin_presets` (a plain list of names, set
     by delete_dashboard_preset() -- see its own comment) removes a
-    built-in that was deleted without a saved override, so a delete
-    stays a real, permanent choice with nothing to actually delete out
-    of app_config.json (there was never a copy in there to remove)."""
+    built-in that was deleted, so a delete stays a real choice with
+    nothing to actually delete out of app_config.json (there was never
+    a copy in there to remove); AppController.restore_dismissed_
+    dashboard_presets() clears that list to bring them all back, which
+    is the only way back now that resaving over the name no longer
+    un-dismisses one."""
     d = cfg.get("dashboard") or {}
     dismissed = set(d.get("dismissed_builtin_presets") or [])
 
@@ -179,6 +192,80 @@ def resolve_dashboard_presets(cfg):
               if name not in dismissed}
     merged.update(d.get("presets") or {})
     return merged
+
+
+def free_preset_name(base, taken, suffix="custom"):
+    """A preset name derived from `base` that isn't already in `taken`:
+    "Fusion Core" -> "Fusion Core (custom)", then "(custom 2)",
+    "(custom 3)", ... Shared by the save-time guard against overwriting
+    a built-in and by migrate_unshadow_builtin_presets() below, so a
+    config migrated yesterday and a save made today land on the same
+    naming rather than two near-identical conventions."""
+    candidate = f"{base} ({suffix})"
+    n = 2
+    while candidate in taken:
+        candidate = f"{base} ({suffix} {n})"
+        n += 1
+    return candidate
+
+
+def migrate_unshadow_builtin_presets(cfg):
+    """One-time fix for a config saved back when overwriting a built-in
+    was allowed: any `dashboard.presets` entry whose name matches a
+    current BUILTIN_DASHBOARD_PRESETS key is renamed to a free
+    "<name> (custom)" (see free_preset_name()).
+
+    Built-ins are read-only now -- saving over one creates a copy
+    instead (AppController.save_dashboard_preset()) -- so an existing
+    same-named saved entry is the last thing that can still shadow one.
+    Renaming rather than deleting keeps both: the person's own edited
+    version stays, under a name that says what it is, and the built-in
+    it was covering reappears at whatever this app version defines it
+    as.
+
+    Runs after migrate_strip_redundant_builtin_presets(), which removes
+    the *untouched* copies an old seeded install had -- so by the time
+    this sees a collision, it's a real customization worth keeping, not
+    a stale duplicate of the same thing.
+
+    Mutates `cfg` in place and returns True if it changed anything --
+    same caller contract as the other migrate_* functions here. Flagged
+    via `dashboard._unshadowed_builtin_presets_v1` so it runs exactly
+    once: a person is free to hand-edit a colliding name back in
+    afterwards, and this shouldn't keep undoing that on every load."""
+    d = cfg.get("dashboard")
+    if not isinstance(d, dict):
+        return False
+    if d.get("_unshadowed_builtin_presets_v1"):
+        return False
+    d["_unshadowed_builtin_presets_v1"] = True
+
+    presets = d.get("presets")
+    if not isinstance(presets, dict) or not presets:
+        return True
+
+    from .themes import dashboard_theme  # lazy: keep load_config() light for callers that don't need it
+
+    builtins = dashboard_theme.BUILTIN_DASHBOARD_PRESETS
+    collisions = [name for name in presets if name in builtins]
+    if not collisions:
+        return True
+
+    for name in collisions:
+        taken = set(presets) | set(builtins)
+        renamed = free_preset_name(name, taken)
+        presets[renamed] = presets.pop(name)
+        # A built-in that was both dismissed and shadowed was only ever
+        # visible *as* the saved override; now that the override has
+        # moved aside, leaving it dismissed would make the preset the
+        # person was actually using disappear from the picker. Their
+        # copy survives under the new name either way, but the built-in
+        # they'd effectively un-deleted by saving over it should come
+        # back with it.
+        dismissed = d.get("dismissed_builtin_presets")
+        if isinstance(dismissed, list) and name in dismissed:
+            dismissed.remove(name)
+    return True
 
 
 def migrate_strip_redundant_builtin_presets(cfg):

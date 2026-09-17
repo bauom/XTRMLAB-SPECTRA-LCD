@@ -58,6 +58,8 @@ a = Analysis(
         # "every theme looks the same" problem they were added to fix
         # -- so they're a real build dependency, not decoration.
         ("assets/fonts/*.ttf", "assets/fonts"),
+        ("assets/fonts/*-OFL.txt", "assets/fonts"),
+        ("assets/fonts/LICENSES.md", "assets/fonts"),
     ],
     hiddenimports=hidden_imports,
     hookspath=[],

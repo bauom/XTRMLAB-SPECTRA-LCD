@@ -193,6 +193,37 @@ export function saveDashboardPreset(name, elements, background) {
   }).then(asJson);
 }
 
+export function exportDashboardPreset(name) {
+  // Returns {name, preset} with every image the preset references
+  // inlined as base64 (controller.py's export_dashboard_preset()), so
+  // the file the user saves works on someone else's machine instead of
+  // pointing at paths only theirs has.
+  return fetch("/api/dashboard/presets/export", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  }).then(asJson);
+}
+
+export function importDashboardPreset(name, preset) {
+  return fetch("/api/dashboard/presets/import", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, preset }),
+  }).then(asJson);
+}
+
+export function restoreBuiltinDashboardPresets() {
+  // Puts every deleted built-in preset back (controller.py's
+  // restore_dismissed_dashboard_presets()). No arguments: built-ins
+  // are read-only, so deleting one is the only state there is to undo.
+  return fetch("/api/dashboard/presets/restore_builtins", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  }).then(asJson);
+}
+
 export function deleteDashboardPreset(name) {
   return fetch("/api/dashboard/presets/delete", {
     method: "POST",
